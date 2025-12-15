@@ -1,8 +1,7 @@
-import * as THREE from 'three';
-import { FlyControls } from 'three/addons/controls/FlyControls.js';
-import { EXRLoader } from 'three/addons/loaders/EXRLoader.js';
-import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-// Se il modello e Draco compresso, vedi note in fondo su DRACOLoader.
+import * as THREE from "three";
+import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
+import { EXRLoader } from "three/addons/loaders/EXRLoader.js";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 
 // ---------------------------------------------------------------------
 // Core variables
@@ -10,29 +9,43 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 let scene, camera, renderer, controls;
 let pmremGenerator;
 
-const HDRI_PATH = './assets/skybox/horn-koppe_snow_4k.exr';
-
-// >>> metti qui il tuo modello (consigliato .glb)
-const MODEL_PATH = './assets/models/sketchfab_model.glb';
+const HDRI_PATH = "./assets/skybox/horn-koppe_snow_4k.exr";
+const MODEL_PATH = "./assets/models/winter_camping.glb";
 
 const clock = new THREE.Clock();
 
-// “Player” tuning
-const EYE_HEIGHT = 1.7;         // altezza camera sopra il terreno
-const PLAYER_RADIUS = 0.45;     // raggio collisione semplice
-const ZOOM_DOLLY_SPEED = 0.02;  // velocita zoom con rotellina
+// Player tuning
+const EYE_HEIGHT = 1.7;
+const PLAYER_RADIUS = 0.45;
+
+// FPS movement tuning
+const MOVE_SPEED = 10.0; // m/s
+const LOOK_MAX_PITCH = 85; // degrees (anti-flip)
+const FOV_MIN = 35;
+const FOV_MAX = 80;
+
+// Terrain tuning (must match createTerrain size)
+const TERRAIN_SIZE = 260;
+const TERRAIN_HALF = TERRAIN_SIZE / 2;
 
 // World objects
 let terrainMesh = null;
-const colliders = [];           // mesh statiche “solide”
-const colliderBoxes = [];       // bounding box precomputate
+const colliderBoxes = []; // AABBs expanded by PLAYER_RADIUS
 
-// Reuse vectors/objects
+// Reuse
 const tmpDir = new THREE.Vector3();
-const prevPos = new THREE.Vector3();
+const prevPlayerPos = new THREE.Vector3();
 const downRay = new THREE.Raycaster();
 const downOrigin = new THREE.Vector3();
 
+const keys = { w: false, a: false, s: false, d: false };
+
+// Ground fallback (important!)
+let lastGroundY = 0;
+
+// ---------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------
 init();
 animate();
 
@@ -42,38 +55,44 @@ function init() {
 
   // Camera
   camera = new THREE.PerspectiveCamera(
-    60,
+    70,
     window.innerWidth / window.innerHeight,
     0.1,
     1000
   );
-  camera.position.set(0, 3.0, 8);
 
   // Renderer
-  const canvas = document.getElementById('webgl-canvas');
+  const canvas = document.getElementById("webgl-canvas");
   renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.0;
   renderer.outputColorSpace = THREE.SRGBColorSpace;
-
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
-  // PMREM for env map
+  // PMREM
   pmremGenerator = new THREE.PMREMGenerator(renderer);
   pmremGenerator.compileEquirectangularShader();
 
-  // Controls: free movement + “look while dragging”
-  controls = new FlyControls(camera, renderer.domElement);
-  controls.movementSpeed = 12;
-  controls.rollSpeed = 0;          // evita inclinazione (piu “walking”)
-  controls.dragToLook = true;
+  // FPS Controls (PointerLock)
+  controls = new PointerLockControls(camera, renderer.domElement);
+  scene.add(controls.getObject());
 
-  // Zoom / dezoom (dolly along view dir)
-  renderer.domElement.addEventListener('wheel', onWheelZoom, { passive: false });
+  // IMPORTANT: camera local offset must be zero; player position is controls.getObject().position
+  camera.position.set(0, 0, 0);
+
+  // Click to lock mouse (like games)
+  renderer.domElement.addEventListener("pointerdown", () => controls.lock());
+  renderer.domElement.addEventListener("contextmenu", (e) => e.preventDefault());
+
+  // Wheel zoom
+  renderer.domElement.addEventListener("wheel", onWheelZoom, { passive: false });
+
+  // Input
+  window.addEventListener("keydown", onKeyDown);
+  window.addEventListener("keyup", onKeyUp);
 
   // Lights
   addLights();
@@ -82,25 +101,31 @@ function init() {
   terrainMesh = createTerrain();
   scene.add(terrainMesh);
 
-  createLandmarks(); // ostacoli di test + collisioni
+  createLandmarks(); // optional test obstacles
 
-  // HDRI background + environment
+  // HDRI
   loadHDRI(HDRI_PATH);
 
-  // >>> Carica e piazza un modello Sketchfab in un punto della mappa
-  // Scegli tu x,z (metri della tua scena). Y viene calcolata dal terreno.
+  // Example Sketchfab model
   loadSketchfabModel({
     path: MODEL_PATH,
-    x: 25,
-    z: -40,
-    scale: 2.0,            // cambia in base al modello
-    yawDeg: 135,           // rotazione attorno a Y (gradi)
-    yOffset: 0.0,          // se sprofonda o “galleggia”, aggiusta qui
-    addToCollisions: true  // collisione bbox (grezza ma funziona)
+    x: 0,
+    z: 0,
+    targetHeight: 6.0,   // altezza desiderata in metri (cambia pure)
+    yawDeg: 0,
+    yOffset: 0.0,
+    addToCollisions: true,
   });
 
+
+  // Spawn player
+  const spawnX = 0, spawnZ = 8;
+  const g = sampleGroundY(spawnX, spawnZ, 0);
+  lastGroundY = g;
+  controls.getObject().position.set(spawnX, g + EYE_HEIGHT, spawnZ);
+
   // Resize
-  window.addEventListener('resize', onWindowResize);
+  window.addEventListener("resize", onWindowResize);
 }
 
 function addLights() {
@@ -124,57 +149,6 @@ function addLights() {
 }
 
 // ---------------------------------------------------------------------
-// Sketchfab model loader (GLB/glTF via GLTFLoader)
-// ---------------------------------------------------------------------
-function loadSketchfabModel({
-  path,
-  x,
-  z,
-  scale = 1.0,
-  yawDeg = 0,
-  yOffset = 0,
-  addToCollisions = true
-}) {
-  const loader = new GLTFLoader();
-
-  loader.load(
-    path,
-    (gltf) => {
-      const root = gltf.scene;
-
-      // piazza sul terreno
-      const groundY = sampleGroundY(x, z);
-      root.position.set(x, groundY + yOffset, z);
-
-      // scala e rotazione
-      root.scale.setScalar(scale);
-      root.rotation.y = THREE.MathUtils.degToRad(yawDeg);
-
-      // ombre (molti modelli arrivano con castShadow disattivo)
-      root.traverse((o) => {
-        if (o.isMesh) {
-          o.castShadow = true;
-          o.receiveShadow = true;
-        }
-      });
-
-      scene.add(root);
-
-      // collisioni (bbox unica del modello)
-      if (addToCollisions) {
-        // importante: aggiorna matrici prima della bbox
-        root.updateMatrixWorld(true);
-        registerCollider(root);
-      }
-
-      console.log('Model loaded:', path);
-    },
-    undefined,
-    (err) => console.error('Error loading model:', path, err)
-  );
-}
-
-// ---------------------------------------------------------------------
 // HDRI Loader (EXR)
 // ---------------------------------------------------------------------
 function loadHDRI(path) {
@@ -185,39 +159,37 @@ function loadHDRI(path) {
     path,
     (texture) => {
       texture.mapping = THREE.EquirectangularReflectionMapping;
-
       const envMap = pmremGenerator.fromEquirectangular(texture).texture;
+
       scene.background = envMap;
       scene.environment = envMap;
 
       texture.dispose();
       pmremGenerator.dispose();
-      console.log('HDRI loaded:', path);
+      console.log("HDRI loaded:", path);
     },
     undefined,
-    (error) => console.error('Error loading EXR HDRI:', error)
+    (error) => console.error("Error loading EXR HDRI:", error)
   );
 }
 
 // ---------------------------------------------------------------------
-// Terrain (procedurale, semplice)
+// Terrain (procedurale)
 // ---------------------------------------------------------------------
 function createTerrain() {
-  const size = 260;
+  const size = TERRAIN_SIZE;
   const seg = 220;
 
   const geo = new THREE.PlaneGeometry(size, size, seg, seg);
   geo.rotateX(-Math.PI / 2);
 
-  // heightmap noise
   const pos = geo.attributes.position;
-  const amp = 3.5;     // altezza colline
-  const freq = 0.045;  // “scala” del rumore
+  const amp = 3.5;
+  const freq = 0.045;
 
   for (let i = 0; i < pos.count; i++) {
     const x = pos.getX(i);
     const z = pos.getZ(i);
-
     const h =
       0.60 * noise2D(x * freq, z * freq) +
       0.30 * noise2D(x * freq * 2.2, z * freq * 2.2) +
@@ -232,20 +204,19 @@ function createTerrain() {
     color: 0xffffff,
     roughness: 0.95,
     metalness: 0.0,
+    side: THREE.DoubleSide, // IMPORTANT: if you ever look from below you still see terrain
   });
 
   const mesh = new THREE.Mesh(geo, mat);
   mesh.receiveShadow = true;
-  mesh.name = 'terrain';
+  mesh.name = "terrain";
   return mesh;
 }
 
-// value-noise 2D (deterministico, senza librerie)
+// deterministic value-noise 2D
 function noise2D(x, z) {
-  const x0 = Math.floor(x);
-  const z0 = Math.floor(z);
-  const x1 = x0 + 1;
-  const z1 = z0 + 1;
+  const x0 = Math.floor(x), z0 = Math.floor(z);
+  const x1 = x0 + 1, z1 = z0 + 1;
 
   const sx = smoothstep(x - x0);
   const sz = smoothstep(z - z0);
@@ -262,7 +233,7 @@ function noise2D(x, z) {
 
 function hash2D(x, z) {
   const s = Math.sin(x * 127.1 + z * 311.7) * 43758.5453123;
-  return s - Math.floor(s); // fract
+  return s - Math.floor(s);
 }
 
 function smoothstep(t) {
@@ -274,7 +245,7 @@ function lerp(a, b, t) {
 }
 
 // ---------------------------------------------------------------------
-// Landmarks + collision boxes (ostacoli di test)
+// Landmarks (test) + auto collision
 // ---------------------------------------------------------------------
 function createLandmarks() {
   const houseMat = new THREE.MeshStandardMaterial({ color: 0xffd2a6, roughness: 0.8 });
@@ -283,10 +254,11 @@ function createLandmarks() {
   const leavesMat = new THREE.MeshStandardMaterial({ color: 0x2e6b3a, roughness: 1.0 });
 
   const placeOnGround = (obj, x, z) => {
-    const y = sampleGroundY(x, z);
+    const y = sampleGroundY(x, z, lastGroundY);
     obj.position.set(x, y, z);
   };
 
+  // Houses
   for (let i = 0; i < 10; i++) {
     const base = new THREE.Mesh(new THREE.BoxGeometry(3.2, 2.2, 3.2), houseMat);
     base.castShadow = true;
@@ -306,9 +278,10 @@ function createLandmarks() {
     placeOnGround(house, x, z);
 
     scene.add(house);
-    registerCollider(house);
+    registerCollidersFromObject(house);
   }
 
+  // Trees
   for (let i = 0; i < 40; i++) {
     const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.35, 2.2, 10), trunkMat);
     trunk.castShadow = true;
@@ -327,56 +300,216 @@ function createLandmarks() {
     placeOnGround(tree, x, z);
 
     scene.add(tree);
-    registerCollider(tree);
+    registerCollidersFromObject(tree);
   }
 }
 
-function registerCollider(obj) {
-  colliders.push(obj);
+// ---------------------------------------------------------------------
+// Collision registration (AUTO) for real models
+// ---------------------------------------------------------------------
+function registerCollidersFromObject(root, opts = {}) {
+  const {
+    expand = PLAYER_RADIUS,
+    includeInvisible = false,
+    ignoreNoColliderTag = true,
+    minSize = 0.02,
+  } = opts;
 
-  const box = new THREE.Box3().setFromObject(obj);
-  box.expandByScalar(PLAYER_RADIUS);
-  colliderBoxes.push(box);
+  root.updateMatrixWorld(true);
+
+  const tmpBox = new THREE.Box3();
+  const tmpSize = new THREE.Vector3();
+
+  root.traverse((obj) => {
+    if (!obj.isMesh) return;
+
+    if (!includeInvisible && obj.visible === false) return;
+
+    if (ignoreNoColliderTag) {
+      if (obj.userData && obj.userData.noCollider) return;
+      if ((obj.name || "").toLowerCase().includes("nocollide")) return;
+      if ((obj.parent?.name || "").toLowerCase().includes("nocollide")) return;
+    }
+
+    const mat = obj.material;
+    if (mat && mat.transparent && mat.opacity !== undefined && mat.opacity < 0.2) return;
+
+    tmpBox.setFromObject(obj);
+    if (tmpBox.isEmpty()) return;
+
+    tmpBox.getSize(tmpSize);
+    if (tmpSize.length() < minSize) return;
+
+    tmpBox.expandByScalar(expand);
+    colliderBoxes.push(tmpBox.clone());
+  });
 }
 
 // ---------------------------------------------------------------------
-// “Walking”: camera sempre sul terreno + collisioni
+// Sketchfab model loader (GLB/glTF)
 // ---------------------------------------------------------------------
-function sampleGroundY(x, z) {
-  if (!terrainMesh) return 0;
+function loadSketchfabModel({
+  path,
+  x,
+  z,
+  targetHeight = 6.0,
+  yawDeg = 0,
+  yOffset = 0,
+  addToCollisions = true,
+}) {
+  const loader = new GLTFLoader();
 
-  downOrigin.set(x, 80, z);
+  loader.load(
+    path,
+    (gltf) => {
+      const root = gltf.scene;
+
+      // Ombre
+      root.traverse((o) => {
+        if (o.isMesh) {
+          o.castShadow = true;
+          o.receiveShadow = true;
+        }
+      });
+
+      // 1) calcola bbox e dimensioni originali
+      root.updateMatrixWorld(true);
+      const box0 = new THREE.Box3().setFromObject(root);
+      const size0 = new THREE.Vector3();
+      box0.getSize(size0);
+
+      // 2) auto-scale (se ha senso)
+      if (size0.y > 1e-6) {
+        const s = targetHeight / size0.y;
+        root.scale.setScalar(s);
+      }
+
+      // 3) ruota yaw
+      root.rotation.y = THREE.MathUtils.degToRad(yawDeg);
+
+      // 4) ricalcola bbox dopo scale/rotazione
+      root.updateMatrixWorld(true);
+      const box1 = new THREE.Box3().setFromObject(root);
+
+      // 5) posiziona al centro (x,z) e appoggia la base sul terreno
+      const groundY = sampleGroundY(x, z, lastGroundY);
+
+      // box1.min.y è la base del modello in world coords (relativa alla posizione corrente).
+      // quindi per appoggiare: y = groundY - minY + offset
+      root.position.set(x, groundY - box1.min.y + yOffset, z);
+
+      scene.add(root);
+
+      if (addToCollisions) {
+        registerCollidersFromObject(root, { minSize: 0.05 });
+      }
+
+      console.log("Model loaded:", path);
+      console.log("Model size (approx):", size0, "targetHeight:", targetHeight);
+    },
+    undefined,
+    (err) => console.error("Error loading model:", path, err)
+  );
+}
+
+
+// ---------------------------------------------------------------------
+// Ground sampling + clamp (ROBUST)
+// ---------------------------------------------------------------------
+function sampleGroundY(x, z, fallback = 0) {
+  if (!terrainMesh) return fallback;
+
+  downOrigin.set(x, 200, z);
   downRay.set(downOrigin, new THREE.Vector3(0, -1, 0));
 
   const hits = downRay.intersectObject(terrainMesh, false);
-  return hits.length ? hits[0].point.y : 0;
+  return hits.length ? hits[0].point.y : fallback;
 }
 
-function applyGroundClamp() {
-  const y = sampleGroundY(camera.position.x, camera.position.z);
-  camera.position.y = y + EYE_HEIGHT;
+function applyGroundClampToPlayer() {
+  const player = controls.getObject();
+
+  // keep inside terrain so raycast doesn't miss at the edges
+  player.position.x = THREE.MathUtils.clamp(player.position.x, -TERRAIN_HALF + 1, TERRAIN_HALF - 1);
+  player.position.z = THREE.MathUtils.clamp(player.position.z, -TERRAIN_HALF + 1, TERRAIN_HALF - 1);
+
+  const groundY = sampleGroundY(player.position.x, player.position.z, lastGroundY);
+  lastGroundY = groundY;
+
+  // player is the camera world position (eyes)
+  player.position.y = groundY + EYE_HEIGHT;
 }
 
+// ---------------------------------------------------------------------
+// Collision resolve (point vs expanded AABB)
+// ---------------------------------------------------------------------
 function resolveCollisions() {
+  const player = controls.getObject();
   for (let i = 0; i < colliderBoxes.length; i++) {
-    if (colliderBoxes[i].containsPoint(camera.position)) {
-      camera.position.copy(prevPos);
-      applyGroundClamp();
+    if (colliderBoxes[i].containsPoint(player.position)) {
+      player.position.copy(prevPlayerPos);
+      applyGroundClampToPlayer();
       break;
     }
   }
 }
 
 // ---------------------------------------------------------------------
-// Zoom (dolly)
+// FPS movement + input
+// ---------------------------------------------------------------------
+function onKeyDown(e) {
+  if (!controls.isLocked) return;
+  if (e.code === "KeyW") keys.w = true;
+  if (e.code === "KeyA") keys.a = true;
+  if (e.code === "KeyS") keys.s = true;
+  if (e.code === "KeyD") keys.d = true;
+}
+
+function onKeyUp(e) {
+  if (e.code === "KeyW") keys.w = false;
+  if (e.code === "KeyA") keys.a = false;
+  if (e.code === "KeyS") keys.s = false;
+  if (e.code === "KeyD") keys.d = false;
+}
+
+function updateMovement(dt) {
+  if (!controls.isLocked) return;
+
+  const forward = (keys.w ? 1 : 0) - (keys.s ? 1 : 0);
+  const right = (keys.d ? 1 : 0) - (keys.a ? 1 : 0);
+  if (forward === 0 && right === 0) return;
+
+  tmpDir.set(right, 0, forward).normalize();
+  const speed = MOVE_SPEED * dt;
+
+  if (tmpDir.z !== 0) controls.moveForward(tmpDir.z * speed);
+  if (tmpDir.x !== 0) controls.moveRight(tmpDir.x * speed);
+}
+
+// Hard pitch clamp (no lookAt; doesn't fight pointer lock)
+function clampPitchHard() {
+  // PointerLockControls structure: yawObject (controls.getObject()) -> pitchObject -> camera
+  const pitchObject = controls.getObject().children[0];
+  if (!pitchObject) return;
+
+  const maxPitch = THREE.MathUtils.degToRad(LOOK_MAX_PITCH);
+  pitchObject.rotation.x = THREE.MathUtils.clamp(pitchObject.rotation.x, -maxPitch, maxPitch);
+}
+
+// ---------------------------------------------------------------------
+// Zoom: wheel = FOV, Shift+wheel = dolly (when locked)
 // ---------------------------------------------------------------------
 function onWheelZoom(e) {
   e.preventDefault();
 
-  const dollyAmount = e.deltaY * ZOOM_DOLLY_SPEED * (controls.movementSpeed * 0.1);
+  if (e.shiftKey && controls.isLocked) {
+    const dolly = e.deltaY * 0.01;
+    controls.moveForward(dolly);
+    return;
+  }
 
-  camera.getWorldDirection(tmpDir); // forward
-  camera.position.addScaledVector(tmpDir, dollyAmount);
+  camera.fov = THREE.MathUtils.clamp(camera.fov + e.deltaY * 0.02, FOV_MIN, FOV_MAX);
+  camera.updateProjectionMatrix();
 }
 
 // ---------------------------------------------------------------------
@@ -398,12 +531,13 @@ function animate() {
   requestAnimationFrame(animate);
 
   const dt = clock.getDelta();
+  const player = controls.getObject();
 
-  prevPos.copy(camera.position);
+  prevPlayerPos.copy(player.position);
 
-  controls.update(dt);
-
-  applyGroundClamp();
+  updateMovement(dt);
+  clampPitchHard();
+  applyGroundClampToPlayer();
   resolveCollisions();
 
   renderer.render(scene, camera);
