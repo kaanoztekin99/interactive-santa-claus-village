@@ -1,11 +1,17 @@
 // main.js
 import * as THREE from "three";
 import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
-import { EXRLoader } from "three/addons/loaders/EXRLoader.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 
 import { createAbiskoTerrain } from "./src/environment/abiskoTerrain.js";
-import { registerCollidersFromObject, resolveCollisions } from "./src/collision/colliders.js";
+import { addLights } from "./src/environment/lights.js";
+import { createSunShadowFollower } from "./src/environment/shadows.js";
+import { loadHDRI } from "./src/environment/hdri.js";
+
+import {
+  registerCollidersFromObject,
+  resolveCollisions,
+} from "./src/collision/colliders.js";
 
 const canvas = document.querySelector("#webgl-canvas");
 
@@ -20,26 +26,32 @@ renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.0;
 
+// Shadows must be enabled on the renderer, otherwise lights can't cast shadows.
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x8fb9ff);
 
-const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 8000);
+const camera = new THREE.PerspectiveCamera(
+  60,
+  window.innerWidth / window.innerHeight,
+  0.1,
+  8000
+);
 
 // ------------------------------------------------------------
 // Player tuning
 // IMPORTANT: controls.object.position is our "player position".
 // Here we treat it as the EYE position (camera).
 // ------------------------------------------------------------
-const EYE_HEIGHT = 1.7;        // meters above the snow (camera height)
-const PLAYER_HEIGHT = 1.8;     // used for object collisions
-const PLAYER_RADIUS = 0.45;    // used for object collisions
+const EYE_HEIGHT = 1.7; // meters above the snow (camera height)
+const PLAYER_HEIGHT = 1.8; // used for object collisions
+const PLAYER_RADIUS = 0.45; // used for object collisions
 
-const MOVE_SPEED = 10.0;       // m/s
-const GRAVITY = 30.0;          // m/s^2
-const GROUND_EPS = 0.03;       // tiny lift to avoid clipping into snow
+const MOVE_SPEED = 10.0; // m/s
+const GRAVITY = 30.0; // m/s^2
+const GROUND_EPS = 0.03; // tiny lift to avoid clipping into snow
 
 // Initial camera (will be re-positioned once terrain is ready)
 camera.position.set(0, 120, 180);
@@ -53,42 +65,41 @@ document.addEventListener("click", () => {
 });
 
 // ------------------------------------------------------------
-// Lights (snow-friendly)
+// Lights + Shadow system
 // ------------------------------------------------------------
-scene.add(new THREE.AmbientLight(0xffffff, 0.35));
 
-const sun = new THREE.DirectionalLight(0xffffff, 1.2);
-sun.position.set(-300, 600, 200);
-sun.castShadow = true;
-sun.shadow.mapSize.set(2048, 2048);
-sun.shadow.camera.near = 1;
-sun.shadow.camera.far = 2500;
-sun.shadow.camera.left = -700;
-sun.shadow.camera.right = 700;
-sun.shadow.camera.top = 700;
-sun.shadow.camera.bottom = -700;
-scene.add(sun);
+// Create lights via module (keeps main.js clean and consistent).
+const { sun } = addLights(scene, {
+  // Keep values aligned with your old main.js defaults:
+  hemiIntensity: 0.35,
+  sunIntensity: 1.2,
+  shadowMapSize: 2048,
+});
+
+// Create a "shadow follower" so shadows don't disappear when you walk far away.
+// The radius is the HALF-size of the shadow box around the player.
+// Increase if you want shadows visible farther away; decrease for sharper shadows.
+const shadowFollower = createSunShadowFollower(sun, scene, {
+  radius: 350,
+  // Keeps the same sun direction/feel as your previous hard-coded position.
+  sunOffset: new THREE.Vector3(-300, 600, 200),
+  near: 1,
+  far: 2500,
+  // Snapping reduces shimmer when moving. Try 0 to disable.
+  snap: 5,
+});
 
 // ------------------------------------------------------------
-// HDRI (EXR)
-// Note: the warning "THREE.DataUtils.toHalfFloat(): Value out of range."
-// can happen with HDR values in EXR. It's usually harmless with tone mapping.
+// HDRI (EXR) via module
 // ------------------------------------------------------------
+// IMPORTANT:
+// - HDRI/IBL makes materials look realistic (diffuse + reflections).
+// - It does NOT create sharp shadows by itself. Shadows come from DirectionalLight.
+// - Your current hdri.js disposes the PMREM generator inside loadHDRI().
+//   That's fine if you load exactly one HDRI during startup.
 const pmrem = new THREE.PMREMGenerator(renderer);
 pmrem.compileEquirectangularShader();
-
-new EXRLoader().load(
-  "./assets/skybox/horn-koppe_snow_4k.exr",
-  (exr) => {
-    const envMap = pmrem.fromEquirectangular(exr).texture;
-    scene.environment = envMap;
-    scene.background = envMap;
-    exr.dispose();
-    pmrem.dispose();
-  },
-  undefined,
-  (err) => console.warn("HDRI failed to load, using flat background.", err)
-);
+loadHDRI("./assets/skybox/horn-koppe_snow_4k.exr", scene, pmrem);
 
 // ------------------------------------------------------------
 // Terrain
@@ -161,7 +172,7 @@ gltfLoader.load(
     // Register colliders from the GLB (AABBs from meshes)
     // If you have meshes that should NOT collide, set mesh.userData.noCollider = true
     registerCollidersFromObject(model, {
-      expand: 0.02,  // small expansion; big values make collisions feel "fat"
+      expand: 0.02, // small expansion; big values make collisions feel "fat"
       minSize: 0.05, // ignore tiny decorative meshes
     });
 
@@ -173,8 +184,7 @@ gltfLoader.load(
       if (groundY == null) return; // terrain not ready yet
 
       const box = new THREE.Box3().setFromObject(model);
-      const lift = (groundY + GROUND_EPS) - box.min.y;
-
+      const lift = groundY + GROUND_EPS - box.min.y;
       model.position.y += lift;
     };
 
@@ -203,6 +213,9 @@ const velocity = new THREE.Vector3();
 const dir = new THREE.Vector3();
 const clock = new THREE.Clock();
 
+// Temp to avoid allocations every frame.
+const playerGroundPos = new THREE.Vector3();
+
 function tick() {
   requestAnimationFrame(tick);
 
@@ -228,7 +241,9 @@ function tick() {
     forward.y = 0;
     forward.normalize();
 
-    const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0, 1, 0)).normalize();
+    const right = new THREE.Vector3()
+      .crossVectors(forward, new THREE.Vector3(0, 1, 0))
+      .normalize();
 
     const move = new THREE.Vector3()
       .addScaledVector(forward, dir.z)
@@ -263,37 +278,46 @@ function tick() {
     // Object collisions (GLB etc.)
     // We resolve in XZ and let the player slide along surfaces.
     // ----------------------------
-    resolveCollisions(
-      controls.object.position,
-      prevPos,
-      null,
-      {
-        radius: PLAYER_RADIUS,
-        height: PLAYER_HEIGHT,
-        eyeOffset: EYE_HEIGHT, // because controls.object.position is the EYE position
-        maxIters: 4,
-        skin: 0.01,
-      }
-    );
+    resolveCollisions(controls.object.position, prevPos, null, {
+      radius: PLAYER_RADIUS,
+      height: PLAYER_HEIGHT,
+      eyeOffset: EYE_HEIGHT, // because controls.object.position is the EYE position
+      maxIters: 4,
+      skin: 0.01,
+    });
 
     // ----------------------------
     // Terrain clamp (camera always above snow)
     // After resolving object collisions, clamp to the terrain.
     // ----------------------------
-    const groundY2 = getGroundY(controls.object.position.x, controls.object.position.z);
+    const groundY2 = getGroundY(
+      controls.object.position.x,
+      controls.object.position.z
+    );
+
     if (groundY2 != null) {
       const minEyeY = groundY2 + EYE_HEIGHT;
-
       if (controls.object.position.y < minEyeY) {
         controls.object.position.y = minEyeY;
         velocity.y = 0;
       }
     }
+
+    // ----------------------------
+    // Shadow follow update
+    // Use the player's "ground-ish" position as the shadow center.
+    // controls.object.position is the EYE, so subtract EYE_HEIGHT.
+    // ----------------------------
+    playerGroundPos.set(
+      controls.object.position.x,
+      (groundY2 ?? controls.object.position.y - EYE_HEIGHT),
+      controls.object.position.z
+    );
+    shadowFollower.update(playerGroundPos);
   }
 
   renderer.render(scene, camera);
 }
-
 tick();
 
 // ------------------------------------------------------------
@@ -302,6 +326,7 @@ tick();
 function onResize() {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
+
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 }
