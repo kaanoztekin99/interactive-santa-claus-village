@@ -57,3 +57,7 @@ Desktop.ini
 # Three.js / Web Project Cache
 .cache/
 .parcel-cache/
+
+# EXR files in assets
+*.exr
+assets/skybox/*.exr
