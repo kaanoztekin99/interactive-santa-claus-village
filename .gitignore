@@ -54,6 +54,12 @@ Desktop.ini
 .idea/
 *.iml
 
+# Node / npm
+node_modules/
+
+# IntelliJ IDEA
+.idea/
+*.iml
 # Three.js / Web Project Cache
 .cache/
 .parcel-cache/
