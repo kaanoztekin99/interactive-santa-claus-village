@@ -67,3 +67,4 @@ node_modules/
 # EXR files in assets
 *.exr
 assets/skybox/*.exr
+assets/models/*.glb
