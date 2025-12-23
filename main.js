@@ -49,7 +49,7 @@ const EYE_HEIGHT = 1.7; // meters above the snow (camera height)
 const PLAYER_HEIGHT = 1.8; // used for object collisions
 const PLAYER_RADIUS = 0.45; // used for object collisions
 
-const MOVE_SPEED = 10.0; // m/s
+const MOVE_SPEED = 50.0; // m/s
 const GRAVITY = 30.0; // m/s^2
 const GROUND_EPS = 0.03; // tiny lift to avoid clipping into snow
 
