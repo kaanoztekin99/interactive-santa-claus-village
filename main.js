@@ -17,6 +17,7 @@ import { createAbiskoTerrain } from "./src/environment/abiskoTerrain.js";
 import { addLights } from "./src/environment/lights.js";
 import { createSunShadowFollower } from "./src/environment/shadows.js";
 import { loadHDRI } from "./src/environment/hdri.js";
+import Snow from "./src/environment/snow.js";
 
 import {
   clearColliders,
@@ -53,6 +54,19 @@ const camera = new THREE.PerspectiveCamera(
   0.1,
   8000
 );
+
+// Snow system (instantiated once scene/renderer exist)
+let snow = null;
+
+// Instantiate snow with default options; starts immediately
+// You can tweak count/size/speed/wind as desired.
+snow = new Snow(scene, {
+  count: 2500,
+  size: 1.6,
+  speed: 18,
+  texturePath: "./assets/textures/snowflake-svgrepo-com.svg",
+  wind: new THREE.Vector3(3, 0, 1),
+});
 
 // ------------------------------------------------------------
 // Player tuning (feel free to tweak these like "game settings")
@@ -117,7 +131,7 @@ const shadowFollower = createSunShadowFollower(sun, scene, {
 
 const pmrem = new THREE.PMREMGenerator(renderer);
 pmrem.compileEquirectangularShader();
-loadHDRI("./assets/skybox/horn-koppe_snow_4k.exr", scene, pmrem);
+loadHDRI("./assets/skybox/hdr/sunlight_4k.exr", scene, pmrem);
 
 // ------------------------------------------------------------
 // Terrain
@@ -203,6 +217,27 @@ function clampPlayerToTerrainBounds() {
     terrainReady = true;
     computeTerrainBoundsXZ();
 
+    // If we have a snow system, expand it to cover the whole terrain.
+    if (snow) {
+      const box = new THREE.Box3().setFromObject(terrain);
+      if (!box.isEmpty()) {
+        const margin = 10; // extra padding around terrain
+        const area = {
+          x: Math.max(100, box.max.x - box.min.x + margin),
+          y: Math.max(120, box.max.y - box.min.y + 80),
+          z: Math.max(100, box.max.z - box.min.z + margin),
+        };
+
+        const center = new THREE.Vector3(
+          (box.min.x + box.max.x) * 0.5,
+          0,
+          (box.min.z + box.max.z) * 0.5
+        );
+
+        const groundY = box.min.y;
+        snow.setArea(area, center, groundY);
+      }
+    }
     // Spawn the player safely above the snow at (0,0)
     const y0 = getGroundY(0, 0);
     const safeY = (y0 ?? 0) + EYE_HEIGHT + 5.0;
@@ -490,6 +525,7 @@ function tick() {
     shadowFollower.update(playerGroundPos);
   }
 
+  if (typeof snow !== 'undefined' && snow) snow.update(dt);
   renderer.render(scene, camera);
 }
 
