@@ -4,36 +4,29 @@ import * as THREE from "three";
  * Abisko DEM terrain (1 km x 1 km) driven by:
  *  - height_1km_2m_16bit.png  (CPU: vertex displacement)
  *  - slope_deg.png           (GPU: snow vs rock)
- *  - hillshade.png           (GPU: contrast/readability)
+ *  - hillshade.png           (GPU: readability/lighting imprint)
  *
- * Key design goals:
- *  - Keep geometry interactive (downsample the PNG if it's huge)
- *  - Expose a reliable height query API for:
- *      - camera ground clamp (FPS movement)
- *      - model placement (sit on snow)
- *  - Use external GLSL snippets so you can iterate shader logic without touching JS
+ * Clean architecture choice:
+ *  - NO string patching of GLSL in JS.
+ *  - All snow continuity logic lives in the shader files.
+ *  - JS only:
+ *      - builds geometry from the height map
+ *      - loads textures
+ *      - injects external shader chunks
+ *      - sets uniforms (tuning knobs)
  */
 
-// ------------------------------------------------------------
-// Scene scale / performance knobs
-// ------------------------------------------------------------
-
-const TERRAIN_SIZE_M = 1000; // 1km x 1km
-
-// Prevent insane vertex counts (PNG can be 2000x2000+).
-// We'll downsample so we keep <= ~512 segments per side.
+const DEFAULT_TERRAIN_SIZE_M = 1000;
 const MAX_SEGMENTS = 512;
 
-// Elevation range (meters) for YOUR crop (from gdalinfo stats of tile_abisko)
-// Update these if you change crop.
+// Elevation range (meters) for your crop (update if tile changes)
 const ELEV_MIN_M = 478.42;
 const ELEV_MAX_M = 723.65;
 
 // Snow logic (degrees)
-const SNOW_SLOPE_FULL = 12.0; // <= full snow
-const SNOW_SLOPE_NONE = 35.0; // >= no snow
+const SNOW_SLOPE_FULL = 12.0;
+const SNOW_SLOPE_NONE = 35.0;
 
-// Base colors (linear-ish; renderer outputColorSpace handles final conversion)
 const COLOR_SNOW = new THREE.Color(0.92, 0.95, 1.0);
 const COLOR_ROCK = new THREE.Color(0.30, 0.32, 0.35);
 
@@ -43,12 +36,13 @@ const COLOR_ROCK = new THREE.Color(0.30, 0.32, 0.35);
 
 async function fetchText(urlObj) {
   const res = await fetch(urlObj);
-  if (!res.ok) throw new Error(`Failed to fetch shader "${urlObj}": ${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch shader "${urlObj}": ${res.status} ${res.statusText}`);
+  }
   return await res.text();
 }
 
 async function loadImageData(url) {
-  // Fetch -> createImageBitmap -> draw to canvas -> get RGBA
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Failed to fetch ${url}: ${res.status} ${res.statusText}`);
 
@@ -59,7 +53,6 @@ async function loadImageData(url) {
   canvas.width = bmp.width;
   canvas.height = bmp.height;
 
-  // willReadFrequently improves perf for getImageData in some browsers
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   ctx.drawImage(bmp, 0, 0);
 
@@ -74,13 +67,41 @@ function computeStride(w, h) {
 }
 
 function sampleGray01(imageData, x, y) {
-  // Clamp to avoid out-of-bounds access
   const xx = Math.max(0, Math.min(imageData.width - 1, x));
   const yy = Math.max(0, Math.min(imageData.height - 1, y));
   const i = 4 * (yy * imageData.width + xx);
-
-  // Assumes grayscale PNG (R holds the value)
   return imageData.data[i] / 255.0;
+}
+
+function smoothHeightGrid(heights, w, h, iterations = 1) {
+  const tmp = new Float32Array(heights.length);
+
+  for (let it = 0; it < iterations; it++) {
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let sum = 0;
+        let cnt = 0;
+
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            const xx = Math.max(0, Math.min(w - 1, x + dx));
+            const yy = Math.max(0, Math.min(h - 1, y + dy));
+            sum += heights[yy * w + xx];
+            cnt++;
+          }
+        }
+
+        tmp[y * w + x] = sum / cnt;
+      }
+    }
+    heights.set(tmp);
+  }
+}
+
+function mirrorRepeat01(t) {
+  t = t % 2;
+  if (t < 0) t += 2;
+  return t <= 1 ? t : 2 - t;
 }
 
 // ------------------------------------------------------------
@@ -91,9 +112,10 @@ export async function createAbiskoTerrain({
   heightUrl = "/assets/terrain/height_1km_2m_16bit.png",
   slopeUrl = "/assets/terrain/slope_deg.png",
   hillshadeUrl = "/assets/terrain/hillshade.png",
+  sizeM = DEFAULT_TERRAIN_SIZE_M,
 } = {}) {
   // ------------------------------------------------------------
-  // 1) Load external GLSL snippets
+  // 1) Load external GLSL chunks
   // ------------------------------------------------------------
 
   const fragHeaderUrl = new URL("../shaders/abiskoTerrain.fragHeader.glsl", import.meta.url);
@@ -109,12 +131,10 @@ export async function createAbiskoTerrain({
   ]);
 
   // ------------------------------------------------------------
-  // 2) Load heightmap pixels (CPU) + build geometry
+  // 2) Build geometry from height map (CPU displacement)
   // ------------------------------------------------------------
 
   const heightImg = await loadImageData(heightUrl);
-
-  // Downsample: reduce vertex count while still keeping terrain shape.
   const stride = computeStride(heightImg.width, heightImg.height);
 
   const sampleW = Math.floor((heightImg.width - 1) / stride) + 1;
@@ -123,16 +143,12 @@ export async function createAbiskoTerrain({
   const segX = sampleW - 1;
   const segY = sampleH - 1;
 
-  // Heights stored in "shifted meters":
-  //   0.0 == ELEV_MIN_M, positive upward.
   const heights = new Float32Array(sampleW * sampleH);
 
-  // PlaneGeometry is created in XY, we rotate to XZ later.
-  const geom = new THREE.PlaneGeometry(TERRAIN_SIZE_M, TERRAIN_SIZE_M, segX, segY);
+  const geom = new THREE.PlaneGeometry(sizeM, sizeM, segX, segY);
   const pos = geom.attributes.position;
 
   for (let i = 0; i < pos.count; i++) {
-    // Vertex indexing is row-major: x changes fastest.
     const ix = i % (segX + 1);
     const iy = Math.floor(i / (segX + 1));
 
@@ -142,16 +158,24 @@ export async function createAbiskoTerrain({
     const h01 = sampleGray01(heightImg, px, py);
     const elevM = ELEV_MIN_M + h01 * (ELEV_MAX_M - ELEV_MIN_M);
 
-    const shifted = elevM - ELEV_MIN_M;
+    const shifted = elevM - ELEV_MIN_M; // 0 == min elevation
     pos.setZ(i, shifted);
-
     heights[iy * sampleW + ix] = shifted;
+  }
+
+  // Geometry smoothing: removes faceting without destroying macro shape
+  smoothHeightGrid(heights, sampleW, sampleH, 3);
+
+  for (let i = 0; i < pos.count; i++) {
+    const ix = i % (segX + 1);
+    const iy = Math.floor(i / (segX + 1));
+    pos.setZ(i, heights[iy * sampleW + ix]);
   }
 
   pos.needsUpdate = true;
   geom.computeVertexNormals();
 
-  // Now the plane lies on XZ with Y up.
+  // PlaneGeometry is XY by default: rotate to XZ with Y up
   geom.rotateX(-Math.PI / 2);
 
   // ------------------------------------------------------------
@@ -168,15 +192,14 @@ export async function createAbiskoTerrain({
     texLoader.load(hillshadeUrl, resolve, undefined, reject);
   });
 
-  // Data textures: prevent sRGB transforms
+  // These are data maps, not color maps (avoid any sRGB conversion)
   slopeTex.colorSpace = THREE.NoColorSpace;
   hillTex.colorSpace = THREE.NoColorSpace;
 
-  // We want them to align 1:1 with the terrain
   slopeTex.wrapS = slopeTex.wrapT = THREE.ClampToEdgeWrapping;
   hillTex.wrapS = hillTex.wrapT = THREE.ClampToEdgeWrapping;
 
-  // Smooth a bit (reduces aliasing / shimmer)
+  // Linear filtering reduces shimmer and aliasing
   slopeTex.minFilter = slopeTex.magFilter = THREE.LinearFilter;
   hillTex.minFilter = hillTex.magFilter = THREE.LinearFilter;
 
@@ -191,61 +214,62 @@ export async function createAbiskoTerrain({
   });
 
   mat.onBeforeCompile = (shader) => {
-    // ---- uniforms used by our custom GLSL ----
+    // Core textures
     shader.uniforms.uSlopeTex = { value: slopeTex };
     shader.uniforms.uHillTex = { value: hillTex };
 
+    // Snow thresholds
     shader.uniforms.uSnowSlopeFull = { value: SNOW_SLOPE_FULL };
     shader.uniforms.uSnowSlopeNone = { value: SNOW_SLOPE_NONE };
 
+    // Base colors
     shader.uniforms.uSnowColor = { value: COLOR_SNOW.clone() };
     shader.uniforms.uRockColor = { value: COLOR_ROCK.clone() };
 
-    // Micro dunes / sparkle (your shader snippets use these)
-    shader.uniforms.uDuneStrength = { value: 0.35 };
-    shader.uniforms.uDuneFreq = { value: 45.0 };
+    // Visual tuning knobs (these are consumed by GLSL now, not patched by JS)
+    shader.uniforms.uHillStrength = { value: 1.0 }; // mainly affects rock; snow reduces internally
+    shader.uniforms.uHillBlur = { value: 3.2 };     // hillshade blur footprint
+    shader.uniforms.uSlopeBlur = { value: 2.4 };    // slope blur footprint (stabilizes snow mask)
 
-    shader.uniforms.uSparkleStrength = { value: 0.10 };
-    shader.uniforms.uSparklePower = { value: 80.0 }; // (if unused in your GLSL, harmless)
+    // Dunes + sparkle (leave your existing normal/roughness logic intact, just tune)
+    shader.uniforms.uDuneStrength = { value: 0.07 };
+    shader.uniforms.uDuneFreq = { value: 32.0 };
+
+    shader.uniforms.uSparkleStrength = { value: 0.025 };
+    shader.uniforms.uSparklePower = { value: 80.0 };
     shader.uniforms.uSparkleDensity = { value: 2600.0 };
-    shader.uniforms.uSparkleThreshold = { value: 0.985 };
+    shader.uniforms.uSparkleThreshold = { value: 0.992 };
 
     /**
-     * IMPORTANT:
-     * We do NOT rely on Three's built-in `vUv` varying because it's not always compiled
-     * unless certain defines are enabled.
-     *
-     * So we always define our own `vUvTerrain` and sample slope/hillshade with that.
+     * We always define our own UV varying so slope/hillshade sampling is stable.
+     * (Depending on defines, Three may or may not include vUv in compiled shaders.)
      */
-
-    // Vertex: declare varying
     shader.vertexShader = shader.vertexShader.replace(
       "#include <uv_pars_vertex>",
       `#include <uv_pars_vertex>
 varying vec2 vUvTerrain;`
     );
 
-    // Vertex: write varying
     shader.vertexShader = shader.vertexShader.replace(
       "#include <uv_vertex>",
       `#include <uv_vertex>
 vUvTerrain = uv;`
     );
 
-    // Fragment: inject our header after <common>
+    // Inject our custom header after <common>
     shader.fragmentShader = shader.fragmentShader.replace(
       "#include <common>",
       `#include <common>\n${fragHeader}\n`
     );
 
-    // Replace shader chunks with external GLSL snippets
+    // Replace standard chunks with external GLSL snippets
     shader.fragmentShader = shader.fragmentShader.replace("#include <color_fragment>", colorChunk);
     shader.fragmentShader = shader.fragmentShader.replace("#include <roughnessmap_fragment>", roughChunk);
     shader.fragmentShader = shader.fragmentShader.replace("#include <normal_fragment_maps>", normalChunk);
   };
 
-  // Ensure shader program caching doesn't reuse an older variant by accident
-  mat.customProgramCacheKey = () => "abiskoTerrain_vUvTerrain_final_v1";
+  // Force recompilation if you change GLSL files
+  mat.customProgramCacheKey = () => "abiskoTerrain_cleanShaders_v1";
 
   const mesh = new THREE.Mesh(geom, mat);
   mesh.name = "AbiskoTerrain";
@@ -253,27 +277,10 @@ vUvTerrain = uv;`
   mesh.castShadow = false;
 
   // ------------------------------------------------------------
-  // 5) Height sampling (this MUST exist for your main.js)
+  // 5) Height sampling API (strict + wrapped)
   // ------------------------------------------------------------
 
-  /**
-   * Bilinear height query in LOCAL space (x,z are in meters).
-   * Terrain spans [-500..+500] in local X and Z.
-   *
-   * Returns:
-   *  - height in SHIFTED meters (0 == min elevation)
-   *  - null if outside the tile bounds
-   */
-  function getHeightAtLocalXZ(x, z) {
-    const half = TERRAIN_SIZE_M * 0.5;
-
-    // Map [-half..+half] -> [0..1]
-    const u = (x + half) / TERRAIN_SIZE_M;
-    const v = (z + half) / TERRAIN_SIZE_M;
-
-    if (u < 0 || u > 1 || v < 0 || v > 1) return null;
-
-    // Map [0..1] -> [0..sampleW-1], [0..sampleH-1]
+  function sampleHeightAtUV(u, v) {
     const fx = u * (sampleW - 1);
     const fy = v * (sampleH - 1);
 
@@ -296,27 +303,50 @@ vUvTerrain = uv;`
     return hx0 * (1 - ty) + hx1 * ty;
   }
 
-  /**
-   * Height query in WORLD space (x,z are world meters).
-   * Assumes terrain is only translated (no extra rotation/scale applied after creation).
-   */
+  function getHeightAtLocalXZ(x, z) {
+    const half = sizeM * 0.5;
+    const u = (x + half) / sizeM;
+    const v = (z + half) / sizeM;
+
+    if (u < 0 || u > 1 || v < 0 || v > 1) return null;
+    return sampleHeightAtUV(u, v);
+  }
+
+  function getHeightAtLocalXZWrapped(x, z) {
+    const half = sizeM * 0.5;
+    let u = (x + half) / sizeM;
+    let v = (z + half) / sizeM;
+
+    u = mirrorRepeat01(u);
+    v = mirrorRepeat01(v);
+
+    return sampleHeightAtUV(u, v);
+  }
+
   function getHeightAtWorldXZ(x, z) {
     const localX = x - mesh.position.x;
     const localZ = z - mesh.position.z;
+
     const hLocal = getHeightAtLocalXZ(localX, localZ);
     if (hLocal == null) return null;
     return mesh.position.y + hLocal;
   }
 
-  // Expose stable API
+  function getHeightAtWorldXZWrapped(x, z) {
+    const localX = x - mesh.position.x;
+    const localZ = z - mesh.position.z;
+
+    const hLocal = getHeightAtLocalXZWrapped(localX, localZ);
+    return mesh.position.y + hLocal;
+  }
+
   mesh.userData.getHeightAtLocalXZ = getHeightAtLocalXZ;
   mesh.userData.getHeightAtWorldXZ = getHeightAtWorldXZ;
 
-  // This is the function your main.js expects:
   mesh.userData.getHeightAt = (x, z) => getHeightAtWorldXZ(x, z);
+  mesh.userData.getHeightAtWrapped = (x, z) => getHeightAtWorldXZWrapped(x, z);
 
-  // Small metadata that can be useful later
-  mesh.userData.terrainSizeM = TERRAIN_SIZE_M;
+  mesh.userData.terrainSizeM = sizeM;
   mesh.userData.elevMinM = ELEV_MIN_M;
   mesh.userData.elevMaxM = ELEV_MAX_M;
 

@@ -1,31 +1,62 @@
 // abiskoTerrain.colorFragment.glsl
-// Replaces: #include <color_fragment>
-// IMPORTANT: we keep the original chunk first, then override diffuseColor.
+//
+// This replaces MeshStandardMaterial's <color_fragment> chunk.
+// We compute a stable snow factor from slope, then color the terrain.
+// Key goals:
+//  - Snow looks continuous (no harsh patchy contrast).
+//  - Hillshade helps rock readability, but is almost neutral on snow.
+//  - Micro variation exists, but stays subtle under fog and lighting.
 
-#include <color_fragment>
+{
+  // -------------------------
+  // 1) Compute snow factor
+  // -------------------------
+  float slope01 = sampleSlope01(vUvTerrain);
 
-// slope_deg.png assumption:
-// grayscale 0..1 corresponds to 0..90 degrees (adjust if your PNG was scaled differently)
-float slope01 = texture2D(uSlopeTex, vUvTerrain).r;
-float slopeDeg = slope01 * 90.0;
+  // The slope map is slope in degrees baked to grayscale.
+  // Most pipelines encode 0..90 degrees into 0..1, so we restore degrees.
+  float slopeDeg = slope01 * 90.0;
 
-// Snow factor: 1 on flat, 0 on steep
-float snow = 1.0 - smoothstep(uSnowSlopeFull, uSnowSlopeNone, slopeDeg);
+  // snow = 1 for gentle slopes, 0 for steep slopes
+  float snow = 1.0 - smoothstep(uSnowSlopeFull, uSnowSlopeNone, slopeDeg);
 
-// Hillshade: 0..1 (darker valleys, brighter ridges)
-float hill = texture2D(uHillTex, vUvTerrain).r;
+  // -------------------------
+  // 2) Base albedo
+  // -------------------------
+  vec3 base = mix(uRockColor, uSnowColor, snow);
 
-// Micro albedo variation (avoid “flat paint” look)
-float n = noise2(vUvTerrain * 600.0);
-float micro = mix(0.92, 1.06, n);
+  // -------------------------
+  // 3) Gentle micro variation
+  // -------------------------
+  // Lower frequency and tiny amplitude.
+  float n = noise2(vUvTerrain * 360.0);
+  float micro = mix(0.993, 1.007, n);
 
-// Base albedo mix
-vec3 base = mix(uRockColor, uSnowColor, snow);
+  // Apply mainly on snow, but weak (prevents peppery look in fog)
+  base *= mix(1.0, micro, snow * 0.14);
 
-// Hillshade contrast (kept subtle, snow still mostly white)
-base *= mix(0.82, 1.10, hill);
+  // -------------------------
+  // 4) Hillshade influence (snow aware)
+  // -------------------------
+  float hill = sampleHill01(vUvTerrain, snow);
 
-// Apply micro variation mostly on snow
-base *= mix(1.0, micro, snow * 0.7);
+  // Keep hillshade mainly for rock, almost neutral for snow.
+  float hsRock = uHillStrength;
+  float hsSnow = uHillStrength * 0.03;
+  float hs = mix(hsRock, hsSnow, snow);
 
-diffuseColor.rgb = base;
+  // Rock gets a readable range, snow stays around 1.0.
+  float lo = mix(0.90, 0.995, snow);
+  float hi = mix(1.08, 1.005, snow);
+
+  // Convert hs (0..1) into a mix between neutral (1.0) and the hill range
+  float hillLo = mix(1.0, lo, hs);
+  float hillHi = mix(1.0, hi, hs);
+
+  base *= mix(hillLo, hillHi, hill);
+
+  // -------------------------
+  // 5) Output to Three.js
+  // -------------------------
+  diffuseColor.rgb = base;
+}

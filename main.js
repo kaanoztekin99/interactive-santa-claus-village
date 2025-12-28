@@ -1,13 +1,21 @@
 // main.js
 //
-// FPS style movement (PointerLockControls) + terrain height clamp + GLB collisions.
+// FPS movement (PointerLockControls) + terrain height clamp + GLB collisions.
 //
-// What this version adds/changes (as requested):
-// 1) Stop the player ~5 meters BEFORE the terrain boundary (not exactly at the edge).
-// 2) Debug grid removed entirely (no leftover code).
-// 3) Jump with SPACE (classic videogame jump, only when grounded).
-// 4) Run with SHIFT + WASD (faster movement).
-// 5) More accurate, human style comments so the file is easy to explain / document.
+// In this version we do three important visual things:
+//  1) Keep HDRI as the “real” background (photo stays visible).
+//  2) Add a very light fog for depth cueing (subtle, not washing everything out).
+//  3) Add a "visual-only" outer terrain around the playable tile:
+//
+//     Why outer terrain helps:
+//     - The hard border happens because your terrain mesh ends, but the HDRI is infinite.
+//     - By extending terrain visually beyond the playable boundary, you avoid ever seeing
+//       "terrain ends -> background begins" as a hard cut.
+//
+//     Why it must be "visual-only":
+//     - The real DEM covers 1 km x 1 km, and gameplay logic depends on that dataset.
+//     - The outer terrain is just a continuity trick, not real terrain data.
+//     - So player is still clamped to the real tile bounds.
 
 import * as THREE from "three";
 import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
@@ -36,17 +44,27 @@ const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 
-// Tone mapping + output color space for nicer visuals (especially with HDRI)
+// Tone mapping and color space for nicer HDRI lighting.
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.0;
 
-// Enable shadows (DirectionalLight will cast them, meshes must have cast/receiveShadow)
+// Shadows
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x8fb9ff);
+
+/**
+ * Very light fog:
+ * - Adds depth cueing and slightly softens the far distance.
+ * - Does NOT replace HDRI background (background is a separate thing).
+ *
+ * If you feel fog is too strong, reduce density a bit (e.g. 0.00009).
+ * If it's too weak, increase slightly (e.g. 0.00013).
+ */
+scene.fog = new THREE.FogExp2(new THREE.Color(0x8fb9ff), 0.00011);
 
 const camera = new THREE.PerspectiveCamera(
   60,
@@ -55,12 +73,13 @@ const camera = new THREE.PerspectiveCamera(
   8000
 );
 
-// Snow system (instantiated once scene/renderer exist)
-let snow = null;
+camera.position.set(0, 120, 180);
 
-// Instantiate snow with default options; starts immediately
-// You can tweak count/size/speed/wind as desired.
-snow = new Snow(scene, {
+// ------------------------------------------------------------
+// Snow particle system
+// ------------------------------------------------------------
+
+let snow = new Snow(scene, {
   count: 2500,
   size: 1.6,
   speed: 18,
@@ -69,47 +88,45 @@ snow = new Snow(scene, {
 });
 
 // ------------------------------------------------------------
-// Player tuning (feel free to tweak these like "game settings")
+// Player tuning
 // ------------------------------------------------------------
 //
-// IMPORTANT: controls.object.position is treated as the EYE position (camera position).
-// That means "feet Y" = eyeY - EYE_HEIGHT.
+// controls.object.position is the EYE position (camera).
 
-const EYE_HEIGHT = 1.7;     // camera height above ground (meters)
-const PLAYER_HEIGHT = 1.8;  // collision cylinder height (meters)
-const PLAYER_RADIUS = 0.45; // collision cylinder radius (meters)
+const EYE_HEIGHT = 1.7;
+const PLAYER_HEIGHT = 1.8;
+const PLAYER_RADIUS = 0.45;
 
-const WALK_SPEED = 10.0;        // m/s
-const RUN_SPEED = 16.0;         // m/s (SHIFT)
-const GRAVITY = 30.0;           // m/s^2 (higher = snappier fall)
-const JUMP_VELOCITY = 9.0;      // m/s (jump strength)
-const GROUND_EPS = 0.03;        // tiny lift to avoid clipping into snow
+const WALK_SPEED = 10.0;
+const RUN_SPEED = 16.0;
 
-// Anti-tunneling: limit how far you move per physics step in XZ.
-// This greatly reduces "walking through thin walls" at high speed.
-const MAX_STEP = 0.10; // 10 cm per sub-step
+const GRAVITY = 30.0;
+const JUMP_VELOCITY = 9.0;
 
-// Terrain edge buffer: stop ~5 meters before the map boundary.
-const EDGE_BUFFER = 5.0; // meters
+// Tiny lift to avoid "sinking" visual artifacts
+const GROUND_EPS = 0.03;
 
-// Initial camera position (will be reset once terrain is ready)
-camera.position.set(0, 120, 180);
+// Anti-tunneling: split movement into micro-steps in XZ
+const MAX_STEP = 0.10;
 
-// Pointer lock controls (FPS look)
+// How far from the tile border the player must stop.
+// This ensures the player never reaches the ugly contrast zone.
+const EDGE_BUFFER = 0.0;
+
+// ------------------------------------------------------------
+// Controls (FPS)
+// ------------------------------------------------------------
+
 const controls = new PointerLockControls(camera, renderer.domElement);
 scene.add(controls.object);
 
-// Click anywhere to lock pointer (enter FPS mode)
 document.addEventListener("click", () => {
   if (!controls.isLocked) controls.lock();
 });
 
 // ------------------------------------------------------------
-// Lighting + shadow-follow system
+// Lighting + shadow follower
 // ------------------------------------------------------------
-//
-// The "shadow follower" moves the directional light's shadow camera with the player.
-// Without it, shadows disappear as you walk away from the origin.
 
 const { sun } = addLights(scene, {
   hemiIntensity: 0.35,
@@ -126,7 +143,7 @@ const shadowFollower = createSunShadowFollower(sun, scene, {
 });
 
 // ------------------------------------------------------------
-// HDRI (environment lighting / reflections)
+// HDRI
 // ------------------------------------------------------------
 
 const pmrem = new THREE.PMREMGenerator(renderer);
@@ -134,25 +151,62 @@ pmrem.compileEquirectangularShader();
 loadHDRI("./assets/skybox/hdr/sunlight_4k.exr", scene, pmrem);
 
 // ------------------------------------------------------------
-// Terrain
+// Terrain: inner (playable) + outer (visual only)
 // ------------------------------------------------------------
-//
-// createAbiskoTerrain() is assumed to attach a height sampler at:
-//   terrain.userData.getHeightAt(x, z) -> y
-//
-// We also compute the terrain bounding box once and use it to clamp movement,
-// with an additional EDGE_BUFFER so we stop BEFORE the map ends.
 
 let terrain = null;
 let terrainReady = false;
 
-// Terrain bounds in XZ, computed once after terrain is added to the scene.
+// World-space playable bounds (XZ only)
 let terrainXZ = null;
 
+// Visual-only extension mesh
+let outerTerrain = null;
+
+// ------------------------------------------------------------
+// Outer terrain knobs (these are the "art direction" controls)
+// ------------------------------------------------------------
+
 /**
- * Terrain height query helper.
- * Returns null if terrain not ready or the sampler doesn't provide a valid number.
+ * Outer size multiplier:
+ * - inner tile: 1 km x 1 km
+ * - outer: multiplier * inner (e.g. 4 => 4 km x 4 km)
+ *
+ * Performance note:
+ * - Bigger size means farther visible terrain, but you still want to keep
+ *   segment count moderate so it doesn't get too heavy.
  */
+const OUTER_SIZE_MULTIPLIER = 4.0;
+
+/**
+ * Outer terrain resolution:
+ * - This is purely visual, so keep it relatively low.
+ * - If you increase it too much, you'll pay with vertex count.
+ */
+const OUTER_SEGMENTS = 160;
+
+/**
+ * Noise tuning:
+ * The outer terrain uses a "wrapped" sampler, which is continuous
+ * but tends to create mirror-like repeated patterns.
+ *
+ * To make it look less obviously repeated, we add a low-frequency noise
+ * OUTSIDE the real tile only.
+ */
+const OUTER_NOISE_AMPLITUDE_M = 1.2; // meters; keep small to avoid weird hills
+const OUTER_NOISE_FREQ = 0.0016;     // low frequency (big features)
+const OUTER_NOISE_RAMP_M = 380;      // how quickly noise ramps up outside border
+
+/**
+ * Outer terrain vertical offset:
+ * We keep it slightly below the inner mesh to avoid z-fighting artifacts.
+ */
+const OUTER_Y_OFFSET = -0.05;
+
+// ------------------------------------------------------------
+// Terrain helpers
+// ------------------------------------------------------------
+
 function getGroundY(x, z) {
   const fn = terrain?.userData?.getHeightAt;
   if (!terrainReady || typeof fn !== "function") return null;
@@ -161,9 +215,6 @@ function getGroundY(x, z) {
   return Number.isFinite(y) ? y : null;
 }
 
-/**
- * Compute terrain bounds in world space. We use these to keep the player inside the map.
- */
 function computeTerrainBoundsXZ() {
   if (!terrain) return null;
 
@@ -176,17 +227,14 @@ function computeTerrainBoundsXZ() {
     minZ: box.min.z,
     maxZ: box.max.z,
   };
+
   return terrainXZ;
 }
 
-/**
- * Clamp player position in XZ so they cannot reach the terrain edge.
- * We stop EDGE_BUFFER meters before the bounds, plus a small margin for player radius.
- */
 function clampPlayerToTerrainBounds() {
   if (!terrainXZ) return;
 
-  // We include player radius so the camera doesn't visually "touch" the boundary.
+  // We include player radius so you don't visually "touch" the border.
   const margin = EDGE_BUFFER + PLAYER_RADIUS + 0.05;
 
   controls.object.position.x = THREE.MathUtils.clamp(
@@ -202,7 +250,147 @@ function clampPlayerToTerrainBounds() {
   );
 }
 
-// Build terrain asynchronously
+// ------------------------------------------------------------
+// Outer terrain generation
+// ------------------------------------------------------------
+
+/**
+ * Cheap deterministic noise in [-1..1-ish].
+ * Not Perlin/Simplex, but good enough to break obvious repetition.
+ *
+ * The important part:
+ * - Stable (same x,z always produces the same value)
+ * - Very cheap (just a few sin waves)
+ */
+function lowFreqNoise2D(x, z) {
+  const a = Math.sin(x * OUTER_NOISE_FREQ + z * OUTER_NOISE_FREQ * 0.73);
+  const b = Math.sin(x * OUTER_NOISE_FREQ * 0.51 - z * OUTER_NOISE_FREQ * 0.92 + 1.7);
+  const c = Math.sin((x + z) * OUTER_NOISE_FREQ * 0.35 - 0.8);
+  return (a * 0.5 + b * 0.35 + c * 0.15);
+}
+
+/**
+ * Returns 0 inside the real tile, and ramps to 1 as you go outside.
+ * This is crucial: we do NOT want noise to change the playable terrain.
+ *
+ * Using "box distance" (max(dx,dz)) fits naturally for a square tile.
+ */
+function outsideRamp01(x, z, bounds) {
+  const dx = Math.max(0, bounds.minX - x, x - bounds.maxX);
+  const dz = Math.max(0, bounds.minZ - z, z - bounds.maxZ);
+  const d = Math.max(dx, dz);
+  return THREE.MathUtils.clamp(d / OUTER_NOISE_RAMP_M, 0, 1);
+}
+
+/**
+ * Builds a big plane around the inner tile.
+ * Heights come from the wrapped sampler:
+ *   terrain.userData.getHeightAtWrapped(x,z)
+ *
+ * Then we add noise OUTSIDE the tile only to break mirror patterns.
+ *
+ * Important:
+ * - This mesh uses the SAME material as the inner terrain so shading is consistent.
+ * - It's "visual only": no colliders, no height queries, no gameplay logic.
+ */
+function createOuterTerrain(innerTerrain, bounds, {
+  sizeMultiplier = OUTER_SIZE_MULTIPLIER,
+  segments = OUTER_SEGMENTS,
+  yOffset = OUTER_Y_OFFSET,
+} = {}) {
+  const getWrapped = innerTerrain?.userData?.getHeightAtWrapped;
+  if (typeof getWrapped !== "function") {
+    console.warn("Outer terrain requested, but getHeightAtWrapped() is missing.");
+    return null;
+  }
+  if (!bounds) return null;
+
+  // --- outer extents (world space) ---
+  const innerSize = innerTerrain.userData?.terrainSizeM ?? 1000;
+  const outerSize = innerSize * sizeMultiplier;
+
+  const cx = innerTerrain.position.x;
+  const cz = innerTerrain.position.z;
+
+  const outerHalf = outerSize * 0.5;
+  const outerMinX = cx - outerHalf;
+  const outerMaxX = cx + outerHalf;
+  const outerMinZ = cz - outerHalf;
+  const outerMaxZ = cz + outerHalf;
+
+  // We want the same triangle density everywhere.
+  // "segments" means: outer plane would have that many segments across its full size.
+  const metersPerSegment = outerSize / segments;
+
+  // Clone material so polygonOffset does NOT affect the playable tile.
+  const outerMat = innerTerrain.material.clone();
+  outerMat.polygonOffset = true;
+  outerMat.polygonOffsetFactor = 1;
+  outerMat.polygonOffsetUnits = 1;
+
+  // Helper: build one strip (axis-aligned rectangle), then displace Y
+  function buildStrip(x0, x1, z0, z1) {
+    const width = Math.max(1, x1 - x0);
+    const depth = Math.max(1, z1 - z0);
+
+    const segX = Math.max(1, Math.round(width / metersPerSegment));
+    const segZ = Math.max(1, Math.round(depth / metersPerSegment));
+
+    const geom = new THREE.PlaneGeometry(width, depth, segX, segZ);
+    geom.rotateX(-Math.PI / 2);
+
+    // Center strip in world space
+    const mesh = new THREE.Mesh(geom, outerMat);
+    mesh.receiveShadow = true;
+    mesh.castShadow = false;
+    mesh.renderOrder = -1;
+
+    mesh.position.set((x0 + x1) * 0.5, 0, (z0 + z1) * 0.5);
+
+    const pos = geom.attributes.position;
+
+    for (let i = 0; i < pos.count; i++) {
+      // position is local to strip mesh, convert to world
+      const wx = mesh.position.x + pos.getX(i);
+      const wz = mesh.position.z + pos.getZ(i);
+
+      let y = getWrapped(wx, wz);
+
+      // Keep your "outside ramp" + noise logic:
+      const ramp = outsideRamp01(wx, wz, bounds);
+      if (ramp > 0) {
+        y += ramp * OUTER_NOISE_AMPLITUDE_M * lowFreqNoise2D(wx, wz);
+      }
+
+      pos.setY(i, y + yOffset);
+    }
+
+    pos.needsUpdate = true;
+    geom.computeVertexNormals();
+
+    return mesh;
+  }
+
+  // Build a ring: only outside the playable bounds (NO overlap under inner tile)
+  const g = new THREE.Group();
+  g.name = "OuterTerrainRing";
+
+  // North strip: above maxZ
+  g.add(buildStrip(outerMinX, outerMaxX, bounds.maxZ, outerMaxZ));
+  // South strip: below minZ
+  g.add(buildStrip(outerMinX, outerMaxX, outerMinZ, bounds.minZ));
+  // East strip: right of maxX (only across the inner Z range to avoid corner overlap)
+  g.add(buildStrip(bounds.maxX, outerMaxX, bounds.minZ, bounds.maxZ));
+  // West strip: left of minX
+  g.add(buildStrip(outerMinX, bounds.minX, bounds.minZ, bounds.maxZ));
+
+  return g;
+}
+
+// ------------------------------------------------------------
+// Build inner terrain (async), then add outer terrain
+// ------------------------------------------------------------
+
 (async () => {
   try {
     terrain = await createAbiskoTerrain({
@@ -217,11 +405,23 @@ function clampPlayerToTerrainBounds() {
     terrainReady = true;
     computeTerrainBoundsXZ();
 
-    // If we have a snow system, expand it to cover the whole terrain.
+    // Build and add outer terrain once we know the inner bounds.
+    outerTerrain = createOuterTerrain(terrain, terrainXZ, {
+      sizeMultiplier: OUTER_SIZE_MULTIPLIER,
+      segments: OUTER_SEGMENTS,
+      yOffset: OUTER_Y_OFFSET,
+    });
+
+    if (outerTerrain) {
+      scene.add(outerTerrain);
+    }
+
+    // Expand snow only over the INNER terrain.
+    // The outer terrain is just a visual trick; particles everywhere can look odd.
     if (snow) {
       const box = new THREE.Box3().setFromObject(terrain);
       if (!box.isEmpty()) {
-        const margin = 10; // extra padding around terrain
+        const margin = 10;
         const area = {
           x: Math.max(100, box.max.x - box.min.x + margin),
           y: Math.max(120, box.max.y - box.min.y + 80),
@@ -234,11 +434,11 @@ function clampPlayerToTerrainBounds() {
           (box.min.z + box.max.z) * 0.5
         );
 
-        const groundY = box.min.y;
-        snow.setArea(area, center, groundY);
+        snow.setArea(area, center, box.min.y);
       }
     }
-    // Spawn the player safely above the snow at (0,0)
+
+    // Spawn player safely above terrain at (0,0)
     const y0 = getGroundY(0, 0);
     const safeY = (y0 ?? 0) + EYE_HEIGHT + 5.0;
     controls.object.position.set(0, safeY, 0);
@@ -250,11 +450,6 @@ function clampPlayerToTerrainBounds() {
 // ------------------------------------------------------------
 // GLB loader + colliders
 // ------------------------------------------------------------
-//
-// Key detail for your collisions:
-// We MUST register colliders AFTER the model has its final position (after placeOnSnow).
-// The collider system stores static AABBs; if you move the model after registering,
-// the colliders remain behind in the old position.
 
 const gltfLoader = new GLTFLoader();
 
@@ -264,7 +459,7 @@ gltfLoader.load(
     const model = gltf.scene;
     model.name = "VillageModel";
 
-    // Enable shadows on all meshes in the GLB
+    // Enable shadows on all meshes
     model.traverse((obj) => {
       if (obj.isMesh) {
         obj.castShadow = true;
@@ -272,16 +467,12 @@ gltfLoader.load(
       }
     });
 
-    // Choose where you want the model in XZ
     model.position.set(20, 0, -15);
     model.scale.set(1, 1, 1);
 
-    // Add to scene so Box3 sees it
     scene.add(model);
 
-    /**
-     * Move the model vertically so its bounding box bottom rests on the terrain.
-     */
+    // Place the model vertically so it rests on the terrain.
     const placeOnSnow = () => {
       const groundY = getGroundY(model.position.x, model.position.z);
       if (groundY == null) return false;
@@ -294,33 +485,27 @@ gltfLoader.load(
       return true;
     };
 
-    /**
-     * Build colliders from the model meshes.
-     * clearColliders() is OK if this is the only collidable model.
-     * If you later add more collidable objects, remove clearColliders() and
-     * just register additional colliders.
-     */
     const buildColliders = () => {
+      // NOTE:
+      // Colliders are only built for the village model.
+      // We DO NOT create colliders for terrain (player uses height sampling + clamp).
       clearColliders();
 
       registerCollidersFromObject(model, {
-        expand: 0.02,  // slight inflation so you don't visually clip
-        minSize: 0.05, // ignore tiny decorative meshes
+        expand: 0.02,
+        minSize: 0.05,
       });
 
       console.log("Collider boxes:", getColliderBoxesCount());
     };
 
-    /**
-     * Finalize: place model on snow (needs terrain) and only THEN build colliders.
-     */
     const finalize = () => {
       if (!placeOnSnow()) return false;
       buildColliders();
       return true;
     };
 
-    // If terrain wasn't ready when the GLB loaded, retry next frames until it is.
+    // If the GLB loads before the terrain is ready, retry until terrain exists.
     if (!finalize()) {
       const retry = () => {
         if (!finalize()) requestAnimationFrame(retry);
@@ -335,18 +520,14 @@ gltfLoader.load(
 // ------------------------------------------------------------
 // Input (WASD + SHIFT run + SPACE jump)
 // ------------------------------------------------------------
-//
-// We keep a Set of currently pressed keys.
-// For jumping we use a "queued" boolean so holding SPACE doesn't spam jumps.
 
 const keys = new Set();
 let jumpQueued = false;
 
 window.addEventListener("keydown", (e) => {
-  // Prevent the browser from scrolling the page on SPACE
   if (e.code === "Space") e.preventDefault();
 
-  // Queue a jump only on the initial press (not every repeat)
+  // Queue jump only on initial press (prevents auto-repeat jump spam)
   if (e.code === "Space" && !keys.has("Space")) {
     jumpQueued = true;
   }
@@ -362,15 +543,15 @@ window.addEventListener("keyup", (e) => {
 // Movement + physics
 // ------------------------------------------------------------
 
-const velocity = new THREE.Vector3(); // player velocity (m/s)
-const dir = new THREE.Vector3();      // input direction (local)
-const forward = new THREE.Vector3();  // camera forward (flattened on XZ)
-const right = new THREE.Vector3();    // camera right (flattened on XZ)
-const move = new THREE.Vector3();     // world move direction
+const velocity = new THREE.Vector3();
+const dir = new THREE.Vector3();
+const forward = new THREE.Vector3();
+const right = new THREE.Vector3();
+const move = new THREE.Vector3();
 
 const clock = new THREE.Clock();
 
-// Reusable vectors to avoid per-frame allocations
+// Reused vectors to reduce allocations
 const prevPos = new THREE.Vector3();
 const prevStep = new THREE.Vector3();
 const playerGroundPos = new THREE.Vector3();
@@ -378,16 +559,13 @@ const playerGroundPos = new THREE.Vector3();
 function tick() {
   requestAnimationFrame(tick);
 
-  // Cap dt so a slow frame doesn't cause huge "teleport" steps
+  // Cap dt so slow frames don't cause huge movement jumps
   const dt = Math.min(clock.getDelta(), 0.033);
 
   if (controls.isLocked) {
-    // Store previous position (useful as a safety fallback)
     prevPos.copy(controls.object.position);
 
-    // ----------------------------
-    // Build desired movement direction from keys (WASD)
-    // ----------------------------
+    // --- input direction (local) ---
     dir.set(0, 0, 0);
     if (keys.has("KeyW")) dir.z += 1;
     if (keys.has("KeyS")) dir.z -= 1;
@@ -397,15 +575,15 @@ function tick() {
     const hasMoveInput = dir.lengthSq() > 1e-8;
     if (hasMoveInput) dir.normalize();
 
-    // Camera forward (flattened to XZ so we don't "fly" when looking up/down)
+    // --- camera forward flattened to XZ ---
     controls.object.getWorldDirection(forward);
     forward.y = 0;
     if (forward.lengthSq() > 1e-8) forward.normalize();
 
-    // Right direction from forward
+    // --- camera right ---
     right.crossVectors(forward, new THREE.Vector3(0, 1, 0)).normalize();
 
-    // Convert input direction into world space
+    // --- convert local input to world direction ---
     move
       .set(0, 0, 0)
       .addScaledVector(forward, dir.z)
@@ -413,62 +591,42 @@ function tick() {
 
     if (move.lengthSq() > 1e-8) move.normalize();
 
-    // ----------------------------
-    // Walk vs run speed (SHIFT + WASD)
-    // ----------------------------
-    const isRunning =
-      hasMoveInput && (keys.has("ShiftLeft") || keys.has("ShiftRight"));
-
+    // --- run / walk ---
+    const isRunning = hasMoveInput && (keys.has("ShiftLeft") || keys.has("ShiftRight"));
     const speed = isRunning ? RUN_SPEED : WALK_SPEED;
 
-    // Horizontal velocity updates every frame (classic FPS feel)
     velocity.x = move.x * speed;
     velocity.z = move.z * speed;
 
-    // ----------------------------
-    // Ground check (used for jump + gravity behavior)
-    // ----------------------------
+    // --- ground check for jump + gravity ---
     const px = controls.object.position.x;
     const pz = controls.object.position.z;
     const groundY = getGroundY(px, pz);
 
-    // "Grounded" = eye is at or below the minimum allowed eye height (with epsilon)
     let grounded = false;
     if (groundY != null) {
       const minEyeY = groundY + EYE_HEIGHT;
       grounded = controls.object.position.y <= minEyeY + 0.01;
     }
 
-    // ----------------------------
-    // Jump (SPACE)
-    // - Only allowed when grounded
-    // - We consume jumpQueued so holding SPACE won't keep jumping
-    // ----------------------------
+    // --- jump ---
     if (jumpQueued && grounded) {
       velocity.y = JUMP_VELOCITY;
       jumpQueued = false;
-      grounded = false; // immediately treat as airborne for this frame
+      grounded = false;
     } else {
-      // If we didn't jump, clear the queue only when grounded.
-      // (This keeps the behavior responsive if you press SPACE slightly early.)
       if (grounded) jumpQueued = false;
     }
 
-    // ----------------------------
-    // Gravity
-    // We apply gravity as long as terrain exists at the current position.
-    // (If groundY becomes null, we avoid integrating into infinity.)
-    // ----------------------------
+    // --- gravity ---
     if (groundY != null) {
       velocity.y -= GRAVITY * dt;
     } else {
+      // Outside strict tile: stop vertical integration to avoid "falling forever"
       velocity.y = 0;
     }
 
-    // ----------------------------
-    // Anti-tunneling: sub-steps
-    // We split the frame into smaller steps so we don't skip through thin colliders.
-    // ----------------------------
+    // --- anti-tunneling: micro steps ---
     const horizSpeed = Math.hypot(velocity.x, velocity.z);
     const steps = Math.max(1, Math.ceil((horizSpeed * dt) / MAX_STEP));
     const subDt = dt / steps;
@@ -479,7 +637,7 @@ function tick() {
       // Integrate motion for this micro-step
       controls.object.position.addScaledVector(velocity, subDt);
 
-      // Resolve collisions against GLB AABB colliders (slide along surfaces)
+      // Resolve collisions with GLB colliders
       resolveCollisions(controls.object.position, prevStep, null, {
         radius: PLAYER_RADIUS,
         height: PLAYER_HEIGHT,
@@ -488,34 +646,26 @@ function tick() {
         skin: 0.01,
       });
 
-      // Prevent leaving the map: clamp XZ to terrain bounds with a 5m buffer
+      // Keep player inside playable bounds (inner tile only)
       clampPlayerToTerrainBounds();
 
-      // Terrain clamp: keep the camera above the terrain surface
-      const gy = getGroundY(
-        controls.object.position.x,
-        controls.object.position.z
-      );
+      // Clamp to terrain height
+      const gy = getGroundY(controls.object.position.x, controls.object.position.z);
 
       if (gy != null) {
         const minEyeY = gy + EYE_HEIGHT;
-
-        // If we fell below ground, snap to ground and cancel vertical velocity
         if (controls.object.position.y < minEyeY) {
           controls.object.position.y = minEyeY;
           velocity.y = 0;
         }
       } else {
-        // No terrain info -> revert the step (safer than drifting out of world)
+        // If we ever end up outside terrain, revert to safe previous position
         controls.object.position.copy(prevStep);
         velocity.y = 0;
       }
     }
 
-    // ----------------------------
-    // Shadow follow update
-    // We center the shadow box around the player's ground-ish position.
-    // ----------------------------
+    // Update shadow follower around player's ground-ish position
     const gy2 = getGroundY(controls.object.position.x, controls.object.position.z);
     playerGroundPos.set(
       controls.object.position.x,
@@ -525,7 +675,7 @@ function tick() {
     shadowFollower.update(playerGroundPos);
   }
 
-  if (typeof snow !== 'undefined' && snow) snow.update(dt);
+  if (snow) snow.update(dt);
   renderer.render(scene, camera);
 }
 
