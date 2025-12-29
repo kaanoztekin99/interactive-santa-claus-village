@@ -26,6 +26,7 @@ import { addLights } from "./src/environment/lights.js";
 import { createSunShadowFollower } from "./src/environment/shadows.js";
 import { loadHDRI } from "./src/environment/hdri.js";
 import Snow from "./src/environment/snow.js";
+import { placeModelsOnTerrain } from "./src/environment/modelPlacer.js";
 
 import {
   clearColliders,
@@ -97,7 +98,7 @@ const EYE_HEIGHT = 1.7;
 const PLAYER_HEIGHT = 1.8;
 const PLAYER_RADIUS = 0.45;
 
-const WALK_SPEED = 10.0;
+const WALK_SPEED = 100.0;
 const RUN_SPEED = 16.0;
 
 const GRAVITY = 30.0;
@@ -436,6 +437,23 @@ function createOuterTerrain(innerTerrain, bounds, {
 
         snow.setArea(area, center, box.min.y);
       }
+    }
+
+    // Place models
+    try {
+      await placeModelsOnTerrain(scene, terrain, [
+        { path: "./assets/models/winter_tree.glb", count: 10, minSpacing: 3.0, scaleRange: [0.8, 1.2], targetHeight: 80, maxSlopeDeg: 30 },
+        { path: "./assets/models/no_leaf_tree.glb", count: 10, minSpacing: 4.0, scaleRange: [0.7, 1.3], targetHeight: 80, maxSlopeDeg: 35 },
+        { path: "./assets/models/snowy_fallen_tree.glb", count: 0, minSpacing: 6.0, scaleRange: [0.8, 1.1], targetHeight:100, alignToNormal: false },
+        { path: "./assets/models/low_poly_winter_tree_pack.glb", count: 1, minSpacing: 2.5, scaleRange: [0.5, 1.0], targetHeight: 80,maxSlopeDeg: 40 },
+        { path: "./assets/models/sledge.glb", count: 1, minSpacing: 20.0, scaleRange: [0.1, 0.2], targetHeight:10,alignToNormal: false },
+        { path: "./assets/models/poly.glb", count: 1, minSpacing: 20.0, scaleRange: [0.1, 0.2], targetHeight:100,alignToNormal: false },
+        { path: "./assets/models/santas_workshop_lapland_finland.glb", count: 1, minSpacing: 20.0, scaleRange: [0.1, 0.2], targetHeight:1000,alignToNormal: false },
+        { path: "./assets/models/wooden_sledge.glb", count: 1, minSpacing: 20.0, scaleRange: [0.1, 0.2], targetHeight:70,alignToNormal: false },
+        { path: "./assets/models/trees_winter_and_summer.glb", count: 1, minSpacing: 20.0, scaleRange: [0.1, 0.2], targetHeight:10,alignToNormal: false }
+      ]);
+    } catch (e) {
+      console.warn("placeModelsOnTerrain failed:", e);
     }
 
     // Spawn player safely above terrain at (0,0)

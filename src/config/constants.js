@@ -1,5 +1,5 @@
 // Shared configuration values so tuning happens from a single location.
-export const HDRI_PATH = "./assets/skybox/horn-koppe_snow_4k.exr";
+export const HDRI_PATH = "./assets/skybox/hdr/sunlight_4k.exr";
 export const MODEL_PATH = "./assets/models/winter_camping.glb";
 
 export const PLAYER = {
