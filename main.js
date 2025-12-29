@@ -24,7 +24,7 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { createAbiskoTerrain } from "./src/environment/abiskoTerrain.js";
 import { addLights } from "./src/environment/lights.js";
 import { createSunShadowFollower } from "./src/environment/shadows.js";
-import { loadHDRI } from "./src/environment/hdri.js";
+import { loadHDRI, transitionHDRI } from "./src/environment/hdri.js";
 import Snow from "./src/environment/snow.js";
 import { placeModelsOnTerrain } from "./src/environment/modelPlacer.js";
 
@@ -150,6 +150,78 @@ const shadowFollower = createSunShadowFollower(sun, scene, {
 const pmrem = new THREE.PMREMGenerator(renderer);
 pmrem.compileEquirectangularShader();
 loadHDRI("./assets/skybox/hdr/sunlight_4k.exr", scene, pmrem);
+
+// HDRI switching: entries can include metadata (presets, weight, time range).
+// Selection modes supported: 'sequence' | 'shuffle' | 'weighted' | 'time'
+const hdriEntries = [
+  { id: "sun", path: "./assets/skybox/hdr/sunlight_4k.exr", preset: { targetExposure: 1.0, targetSunIntensity: 1.2 } },
+  { id: "sunset", path: "./assets/skybox/hdr/sunset_10k.exr", preset: { targetExposure: 0.7, targetSunIntensity: 0.45 } },
+  { id: "aurora2", path: "./assets/skybox/hdr/aurora_v2.exr", preset: { targetExposure: 0.5, targetSunIntensity: 0.25 } },
+  { id: "dark", path: "./assets/skybox/hdr/dark_8k.exr", preset: { targetExposure: 0.25, targetSunIntensity: 0.08 } },
+  { id: "aurora3", path: "./assets/skybox/hdr/aurora_v3.exr", preset: { targetExposure: 0.6, targetSunIntensity: 0.35 } },
+];
+
+let currentHdriIndex = 0;
+let hdriMode = "sequence"; // change to 'shuffle', 'weighted', or 'time' as needed
+let shuffleOrder = null;
+
+function pickNextIndex() {
+  if (hdriMode === "shuffle") {
+    if (!shuffleOrder) {
+      shuffleOrder = hdriEntries.map((_, i) => i);
+      for (let i = shuffleOrder.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffleOrder[i], shuffleOrder[j]] = [shuffleOrder[j], shuffleOrder[i]];
+      }
+    }
+    const idx = shuffleOrder.shift();
+    if (shuffleOrder.length === 0) shuffleOrder = null;
+    return idx ?? 0;
+  }
+
+  if (hdriMode === "weighted") {
+    // simple weight example: assume entries may have `weight` property
+    const total = hdriEntries.reduce((s, e) => s + (e.weight ?? 1), 0);
+    let r = Math.random() * total;
+    for (let i = 0; i < hdriEntries.length; i++) {
+      r -= (hdriEntries[i].weight ?? 1);
+      if (r <= 0) return i;
+    }
+    return 0;
+  }
+
+  if (hdriMode === "time") {
+    const hour = new Date().getHours();
+    // crude mapping: sunrise/sun/sunset/night ranges
+    if (hour >= 6 && hour < 10) return 4; // sunrise -> sunset entry
+    if (hour >= 10 && hour < 17) return 0; // day -> sun
+    if (hour >= 17 && hour < 20) return 4; // sunset
+    return 3; // night
+  }
+
+  // default: sequence
+  return (currentHdriIndex + 1) % hdriEntries.length;
+}
+
+function setHdriIndex(idx) {
+  currentHdriIndex = ((idx % hdriEntries.length) + hdriEntries.length) % hdriEntries.length;
+  const entry = hdriEntries[currentHdriIndex];
+  const opts = entry.preset ?? {};
+  transitionHDRI(entry.path, scene, pmrem, renderer, {
+    sun: sun,
+    duration: opts.duration ?? 2000,
+    targetExposure: opts.targetExposure ?? 1.0,
+    targetSunIntensity: opts.targetSunIntensity ?? 1.0,
+  });
+}
+
+window.addEventListener("keydown", (e) => {
+  if (e.code === "KeyH") {
+    const next = pickNextIndex();
+    setHdriIndex(next);
+    console.log("Switched HDRI to", hdriEntries[currentHdriIndex].id || hdriEntries[currentHdriIndex].path);
+  }
+});
 
 // ------------------------------------------------------------
 // Terrain: inner (playable) + outer (visual only)
