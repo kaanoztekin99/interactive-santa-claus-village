@@ -343,6 +343,13 @@ vUvTerrain = uv;`
   mesh.userData.getHeightAtLocalXZ = getHeightAtLocalXZ;
   mesh.userData.getHeightAtWorldXZ = getHeightAtWorldXZ;
 
+  mesh.userData.getSnowLiftAt = (x, z) => {
+    const h = getHeightAtWorldXZ(x, z);
+    if (h == null) return 0;
+
+    const slopeDeg = 12;
+    return slopeDeg < 15 ? 0.35 : 0.15;
+  };
   mesh.userData.getHeightAt = (x, z) => getHeightAtWorldXZ(x, z);
   mesh.userData.getHeightAtWrapped = (x, z) => getHeightAtWorldXZWrapped(x, z);
 

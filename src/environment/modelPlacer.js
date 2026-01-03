@@ -1,3 +1,4 @@
+// src/environment/modelPlacer.js
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { registerCollidersFromObject } from "../collision/colliders.js";
@@ -6,40 +7,151 @@ const loader = new GLTFLoader();
 const downRay = new THREE.Raycaster();
 const downOrigin = new THREE.Vector3();
 
+/* ---------------------------
+ * Seeded RNG (deterministic)
+ * --------------------------*/
+function xmur3(str) {
+  let h = 1779033703 ^ str.length;
+  for (let i = 0; i < str.length; i++) {
+    h = Math.imul(h ^ str.charCodeAt(i), 3432918353);
+    h = (h << 13) | (h >>> 19);
+  }
+  return function () {
+    h = Math.imul(h ^ (h >>> 16), 2246822507);
+    h = Math.imul(h ^ (h >>> 13), 3266489909);
+    return (h ^= h >>> 16) >>> 0;
+  };
+}
+function mulberry32(a) {
+  return function () {
+    let t = (a += 0x6d2b79f5);
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function makeRng(seed) {
+  const s = typeof seed === "string" ? seed : String(seed ?? "default-seed");
+  const h = xmur3(s)();
+  return mulberry32(h);
+}
+
 function loadGLTF(path) {
   return new Promise((resolve, reject) => {
     loader.load(path, (gltf) => resolve(gltf), undefined, reject);
   });
 }
 
-function randRange(a, b) {
-  return a + Math.random() * (b - a);
+function randRange(rng, a, b) {
+  return a + rng() * (b - a);
 }
 
-export async function placeModelsOnTerrain(scene, terrainMesh, entries = []) {
-  if (!terrainMesh || !terrainMesh.userData || typeof terrainMesh.userData.getHeightAt !== "function") {
-    console.warn("placeModelsOnTerrain: invalid terrainMesh");
+function computeVisibleBox(root) {
+  const box = new THREE.Box3();
+  let has = false;
+
+  root.updateMatrixWorld(true);
+  root.traverse((o) => {
+    if (!o.isMesh) return;
+    if (o.visible === false) return;
+    if (!o.geometry) return;
+
+    // Eğer modellerde görünmez helper/base mesh varsa filtreleyebilirsin:
+    // if (/collider|collision|helper|bounds|trigger/i.test(o.name)) return;
+
+    o.geometry.computeBoundingBox();
+    const b = o.geometry.boundingBox;
+    if (!b) return;
+
+    const wb = b.clone().applyMatrix4(o.matrixWorld);
+    if (!has) {
+      box.copy(wb);
+      has = true;
+    } else {
+      box.union(wb);
+    }
+  });
+
+  return has ? box : null;
+}
+
+function snapToGroundByVisibleBox(obj, hitY, yOffset = 0) {
+  obj.updateMatrixWorld(true);
+  const b = computeVisibleBox(obj) ?? new THREE.Box3().setFromObject(obj);
+
+  if (!b || b.isEmpty()) {
+    obj.position.y = hitY + yOffset;
+    obj.updateMatrixWorld(true);
     return;
   }
 
-  const terrainSize = terrainMesh.userData.terrainSizeM ?? (260);
+  const dy = hitY - b.min.y;
+  obj.position.y += dy + yOffset;
+  obj.updateMatrixWorld(true);
+}
+
+export async function placeModelsOnTerrain(scene, terrainMesh, entries = [], options = {}) {
+  if (!terrainMesh?.userData || typeof terrainMesh.userData.getHeightAt !== "function") {
+    console.warn("placeModelsOnTerrain: invalid terrainMesh");
+    return [];
+  }
+
+  const {
+    seed = "lapland-default",
+    // "bbox" en kesin, "distance" daha hafif
+    overlapMode = "bbox",
+  } = options;
+
+  const rng = makeRng(seed);
+
+  const terrainSize = terrainMesh.userData.terrainSizeM ?? 260;
   const half = terrainSize * 0.5;
 
-  const allPlaced = [];
+  // ✅ GLOBAL: tüm modeller için tek havuz
+  const allPlaced = []; // { x, z, minR, box, path }
+
+  const isFreeByDistance = (x, z, reqR) => {
+    for (const p of allPlaced) {
+      const dx = p.x - x;
+      const dz = p.z - z;
+      const minD = (p.minR ?? 0) + reqR;
+      if (dx * dx + dz * dz < minD * minD) return false;
+    }
+    return true;
+  };
+
+  const isFreeByBBox = (testBox) => {
+    for (const p of allPlaced) {
+      if (p.box && testBox.intersectsBox(p.box)) return false;
+    }
+    return true;
+  };
 
   for (const e of entries) {
     const {
       path,
+      name = null,
+
       count = 10,
       minSpacing = 4.0,
-      maxAttemptsPerItem = 60,
+      maxAttemptsPerItem = 80,
+
       targetHeight = null,
       scaleRange = [1, 1],
+
       yawRange = [0, 360],
       maxSlopeDeg = 35,
       alignToNormal = true,
+
       yOffset = 0,
+
+      // fixed replacements
+      // positions: [{x,z,yawDeg,scale,scaleMul,targetHeightOverride, yOffsetOverride}]
+      positions = null,
+
       addColliders = true,
+      colliderMinSize = 0.30,
+      colliderExpand = 0.00,
     } = e;
 
     let gltf;
@@ -58,116 +170,146 @@ export async function placeModelsOnTerrain(scene, terrainMesh, entries = []) {
       }
     });
 
-    // compute approximate vertical size for optional targeting
+    // proto height for targetHeight scaling
     proto.updateMatrixWorld(true);
-    const box = new THREE.Box3().setFromObject(proto);
-    const size = new THREE.Vector3();
-    box.getSize(size);
+    const protoBox = computeVisibleBox(proto) ?? new THREE.Box3().setFromObject(proto);
+    const protoSize = new THREE.Vector3();
+    protoBox.getSize(protoSize);
+    const protoHeight = protoSize.y;
 
-    const placed = [];
     const slopeThreshold = Math.cos((maxSlopeDeg * Math.PI) / 180.0);
 
-    // helper to perform a single placement at given XZ (optional providedY)
-    const tryPlaceAt = (x, z, providedY = null) => {
-      const y = providedY != null ? providedY : terrainMesh.userData.getHeightAt(x, z);
+    const tryPlaceAt = (x, z, overrides = {}) => {
+      const y = terrainMesh.userData.getHeightAt(x, z);
       if (y == null) return false;
 
-      // raycast down to get normal and precise hit
-      downOrigin.set(x, y + 200, z);
+      // raycast -> hit point & normal
+      downOrigin.set(x, y + 600, z);
       downRay.set(downOrigin, new THREE.Vector3(0, -1, 0));
+      terrainMesh.updateMatrixWorld(true);
+
       const hits = downRay.intersectObject(terrainMesh, false);
       if (!hits.length) return false;
       const hit = hits[0];
 
-      // normal in world space
       const faceNormal = hit.face?.normal ? hit.face.normal.clone() : new THREE.Vector3(0, 1, 0);
       const normalMat = new THREE.Matrix3().getNormalMatrix(terrainMesh.matrixWorld);
       const normalWorld = faceNormal.applyMatrix3(normalMat).normalize();
 
-      // slope check
+      // slope gate
       if (normalWorld.dot(new THREE.Vector3(0, 1, 0)) < slopeThreshold) return false;
 
-      // spacing check
-      for (const p of placed) {
-        const dx = p.x - x;
-        const dz = p.z - z;
-        if (dx * dx + dz * dz < minSpacing * minSpacing) return false;
-      }
+      // global spacing gate
+      const reqR = overrides.minSpacingOverride ?? minSpacing;
+      if (!isFreeByDistance(x, z, reqR)) return false;
 
-      // clone and position
+      // instance
       const instance = proto.clone(true);
+      if (name) instance.name = name;
 
-      // random scale (support optional targetHeight to normalize model height)
-      const protoHeight = size.y;
-      const randScaleFactor = randRange(scaleRange[0], scaleRange[1]);
-      let finalScale = randScaleFactor;
-      if (targetHeight != null && protoHeight > 1e-6) {
-        const baseScale = targetHeight / protoHeight;
-        finalScale = baseScale * randScaleFactor;
+      // scale
+      const desiredTargetHeight = overrides.targetHeightOverride ?? targetHeight;
+      const manualScale = overrides.scale ?? null; // absolute scalar
+      const scaleMul = overrides.scaleMul ?? null; // multiplier
+
+      let finalScale;
+      if (manualScale != null) {
+        finalScale = manualScale;
+      } else {
+        const randScaleFactor = randRange(rng, scaleRange[0], scaleRange[1]);
+        finalScale = randScaleFactor;
+
+        if (desiredTargetHeight != null && protoHeight > 1e-6) {
+          finalScale = (desiredTargetHeight / protoHeight) * randScaleFactor;
+        }
+        if (scaleMul != null) finalScale *= scaleMul;
       }
       instance.scale.setScalar(finalScale);
 
-      // rotation: align to normal then apply random yaw
+      // rotation
       if (alignToNormal) {
         const up = new THREE.Vector3(0, 1, 0);
-        const q = new THREE.Quaternion().setFromUnitVectors(up, normalWorld);
-        instance.quaternion.copy(q);
+        instance.quaternion.copy(new THREE.Quaternion().setFromUnitVectors(up, normalWorld));
       }
-
-      const yawDeg = randRange(yawRange[0], yawRange[1]);
+      const fixedYaw = overrides.yawDeg ?? null;
+      const yawDeg = fixedYaw != null ? fixedYaw : randRange(rng, yawRange[0], yawRange[1]);
       instance.rotateOnAxis(new THREE.Vector3(0, 1, 0), THREE.MathUtils.degToRad(yawDeg));
 
-      // Place instance high above, compute world bbox, then lower so bbox.min.y == hit.point.y
-      const SAFE_HIGH_Y = hit.point.y + 200;
-      instance.position.set(x, SAFE_HIGH_Y, z);
+      // place high then snap by bbox
+      instance.position.set(x, hit.point.y + 200, z);
       instance.updateMatrixWorld(true);
 
-      const box2 = new THREE.Box3().setFromObject(instance);
-      if (box2.isEmpty()) {
-        // fallback: snap instance origin to hit point with offset
-        instance.position.set(x, hit.point.y + yOffset + 0.02, z);
-      } else {
-        const shiftDown = box2.min.y - hit.point.y; // positive if bbox is above hit
-        instance.position.y = instance.position.y - shiftDown + yOffset + 0.02;
+      const yOff = overrides.yOffsetOverride ?? yOffset;
+
+      // only yOffset
+      snapToGroundByVisibleBox(instance, hit.point.y, yOff);
+      if (terrainMesh.userData.getSnowLiftAt) {
+        const snowLift = terrainMesh.userData.getSnowLiftAt(x, z);
+        instance.position.y += snowLift;
+        instance.updateMatrixWorld(true);
+      }
+      // overlap check
+      const b = computeVisibleBox(instance) ?? new THREE.Box3().setFromObject(instance);
+      if (!b || b.isEmpty()) return false;
+
+      if (overlapMode === "bbox") {
+        if (!isFreeByBBox(b)) return false;
       }
 
-      instance.updateMatrixWorld(true);
+      // accept
       scene.add(instance);
+      if (addColliders) {
+        registerCollidersFromObject(instance, {
+          minSize: colliderMinSize,
+          expand: colliderExpand,
+        });
+      }
 
-      if (addColliders) registerCollidersFromObject(instance, { minSize: 0.03 });
-
-      const rec = { path, x, z, y: hit.point.y, instance };
-      placed.push(rec);
-      allPlaced.push(rec);
-      console.log(`Placed ${path} at`, rec.x.toFixed(2), rec.y.toFixed(2), rec.z.toFixed(2));
+      allPlaced.push({ x, z, minR: reqR, box: b, path });
       return true;
     };
 
-    // If explicit positions provided, place at those deterministically
-    if (Array.isArray(e.positions) && e.positions.length > 0) {
-      for (let i = 0; i < Math.min(count, e.positions.length); i++) {
-        const pos = e.positions[i];
-        const px = pos.x ?? pos[0];
-        const pz = pos.z ?? pos[1];
-        const py = pos.y ?? null;
-        if (px == null || pz == null) continue;
-        tryPlaceAt(px, pz, py);
-      }
-    } else {
-      let attempts = 0;
-      while (placed.length < count && attempts < count * maxAttemptsPerItem) {
-        attempts++;
+    // Fixed positions first 
+    if (Array.isArray(positions) && positions.length > 0) {
+      let placedCount = 0;
+      for (let i = 0; i < Math.min(count, positions.length); i++) {
+        const p = positions[i];
 
-        const x = randRange(-half, half);
-        const z = randRange(-half, half);
+        const x = p.x ?? p[0];
+        const z = p.z ?? p[1];
+        if (x == null || z == null) continue;
 
-        tryPlaceAt(x, z);
+        const ok = tryPlaceAt(x, z, {
+          yawDeg: typeof p.yawDeg === "number" ? p.yawDeg : (typeof p.yaw === "number" ? p.yaw : null),
+          scale: typeof p.scale === "number" ? p.scale : null,
+          scaleMul: typeof p.scaleMul === "number" ? p.scaleMul : null,
+          targetHeightOverride: typeof p.targetHeight === "number" ? p.targetHeight : null,
+          yOffsetOverride: typeof p.yOffset === "number" ? p.yOffset : null,
+          minSpacingOverride: typeof p.minSpacing === "number" ? p.minSpacing : null,
+        });
+
+        if (ok) placedCount++;
       }
+      console.log(`Placed ${placedCount}/${count} instances of ${path} (fixed positions)`);
+      continue; // skip random placement
     }
 
-    console.log(`Placed ${placed.length}/${count} instances of ${path}`);
+    // Random placement (seeded)
+    let placedCount = 0;
+    let attempts = 0;
+    const maxAttempts = count * maxAttemptsPerItem;
+
+    while (placedCount < count && attempts < maxAttempts) {
+      attempts++;
+
+      const x = randRange(rng, -half, half);
+      const z = randRange(rng, -half, half);
+
+      if (tryPlaceAt(x, z)) placedCount++;
+    }
+
+    console.log(`Placed ${placedCount}/${count} instances of ${path} (seed="${seed}")`);
   }
-  
-  // return an array of placement records so callers can persist / interact with placed objects
+
   return allPlaced;
 }

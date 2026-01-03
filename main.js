@@ -22,7 +22,6 @@ import { createSunShadowFollower } from "./src/environment/shadows.js";
 import { loadHDRI, transitionHDRI } from "./src/environment/hdri.js";
 import { placeModelsOnTerrain } from "./src/environment/modelPlacer.js";
 import Snow from "./src/environment/snow.js";
-import { placeModelsOnTerrain } from "./src/environment/modelPlacer.js";
 
 import {
   clearColliders,
@@ -80,8 +79,8 @@ const EYE_HEIGHT = PLAYER?.EYE_HEIGHT ?? 1.7;
 let camDir = new THREE.Vector3();
 
 // Movement / physics (still local, unless you also want these in constants.js)
-const WALK_SPEED = 10.0;
-const RUN_SPEED = 16.0;
+const WALK_SPEED = 18.0;
+const RUN_SPEED = 30.0;
 const GRAVITY = 30.0;
 const JUMP_VELOCITY = 9.0;
 
@@ -92,7 +91,7 @@ const GROUND_SNAP_DIST = 0.08; // meters
 const GROUND_EPS = 0.03;
 
 // Anti-tunneling: split movement into micro-steps in XZ
-const MAX_STEP = 0.10;
+const MAX_STEP = 0.8;
 
 // How far from the tile border the player must stop.
 const EDGE_BUFFER = 0.0;
@@ -431,17 +430,80 @@ function createOuterTerrain(
 
     // Place models
     try {
-      await placeModelsOnTerrain(scene, terrain, [
-        { path: "./assets/models/winter_tree.glb", count: 10, minSpacing: 3.0, scaleRange: [0.8, 1.2], targetHeight: 80, maxSlopeDeg: 30 },
-        { path: "./assets/models/no_leaf_tree.glb", count: 10, minSpacing: 4.0, scaleRange: [0.7, 1.3], targetHeight: 80, maxSlopeDeg: 35 },
-        { path: "./assets/models/snowy_fallen_tree.glb", count: 0, minSpacing: 6.0, scaleRange: [0.8, 1.1], targetHeight:100, alignToNormal: false },
-        { path: "./assets/models/low_poly_winter_tree_pack.glb", count: 1, minSpacing: 2.5, scaleRange: [0.5, 1.0], targetHeight: 80,maxSlopeDeg: 40 },
-        { path: "./assets/models/sledge.glb", count: 1, minSpacing: 20.0, scaleRange: [0.1, 0.2], targetHeight:10,alignToNormal: false },
-        { path: "./assets/models/poly.glb", count: 1, minSpacing: 20.0, scaleRange: [0.1, 0.2], targetHeight:100,alignToNormal: false },
-        { path: "./assets/models/santas_workshop_lapland_finland.glb", count: 1, minSpacing: 20.0, scaleRange: [0.1, 0.2], targetHeight:1000,alignToNormal: false },
-        { path: "./assets/models/wooden_sledge.glb", count: 1, minSpacing: 20.0, scaleRange: [0.1, 0.2], targetHeight:70,alignToNormal: false },
-        { path: "./assets/models/trees_winter_and_summer.glb", count: 1, minSpacing: 20.0, scaleRange: [0.1, 0.2], targetHeight:10,alignToNormal: false }
-      ]);
+      await placeModelsOnTerrain(
+        scene,
+        terrain,
+        [
+          {
+            path: "./assets/models/winter_tree.glb",
+            count: 10,
+            minSpacing: 3.0,
+            scaleRange: [0.8, 1.2],
+            targetHeight: 20,
+            maxSlopeDeg: 30,
+            alignToNormal: false,
+            yOffset: -0.12,
+          },
+          {
+            path: "./assets/models/no_leaf_tree.glb",
+            count: 10,
+            minSpacing: 4.0,
+            scaleRange: [0.7, 1.3],
+            targetHeight: 20,
+            maxSlopeDeg: 35,
+            alignToNormal: false,
+            yOffset: -0.12,
+          },
+          {
+            path: "./assets/models/snowy_fallen_tree.glb",
+            count: 0,
+            minSpacing: 6.0,
+            scaleRange: [0.8, 1.1],
+            targetHeight: 100,
+            alignToNormal: false,
+          },
+          {
+            path: "./assets/models/sledge.glb",
+            count: 1,
+            minSpacing: 20.0,
+            scaleRange: [0.1, 0.2],
+            targetHeight: 10,
+            alignToNormal: false,
+            yOffset: -0.3,
+          },
+          {
+            path: "./assets/models/poly.glb",
+            count: 1,
+            minSpacing: 20.0,
+            scaleRange: [0.1, 0.2],
+            targetHeight: 100,
+            alignToNormal: false,
+          },
+          {
+            path: "./assets/models/santas_workshop_lapland_finland.glb",
+            count: 1,
+            minSpacing: 25.0,
+            scaleRange: [0.1, 0.2],
+            targetHeight: 250,
+            alignToNormal: false,
+            yOffset: -0.02,
+            positions: [{ x: 120, z: -480, yawDeg: 35 }],
+          },
+          {
+            path: "./assets/models/wooden_sledge.glb",
+            count: 1,
+            minSpacing: 20.0,
+            scaleRange: [0.1, 0.2],
+            targetHeight: 70,
+            alignToNormal: false,
+            yOffset: -0.3,
+          }
+        ],
+        {
+          seed: "LAPLAND-v1",
+          overlapMode: "bbox",
+        }
+      );
     } catch (e) {
       console.warn("placeModelsOnTerrain failed:", e);
     }
@@ -477,11 +539,43 @@ gltfLoader.load(
     model.scale.set(1, 1, 1);
     scene.add(model);
 
+    const computeVisibleBox = (root) => {
+      const box = new THREE.Box3();
+      let has = false;
+
+      root.updateMatrixWorld(true);
+
+      root.traverse((o) => {
+        if (!o.isMesh) return;
+        if (o.visible === false) return;
+        if (!o.geometry) return;
+
+        // İstersen ele:
+        // if (/collider|collision|helper|bounds|trigger/i.test(o.name)) return;
+
+        o.geometry.computeBoundingBox();
+        const b = o.geometry.boundingBox;
+        if (!b) return;
+
+        const wb = b.clone().applyMatrix4(o.matrixWorld);
+        if (!has) {
+          box.copy(wb);
+          has = true;
+        } else {
+          box.union(wb);
+        }
+      });
+
+      return has ? box : null;
+    };
+
     const placeOnSnow = () => {
       const groundY = getGroundY(model.position.x, model.position.z);
       if (groundY == null) return false;
 
-      const box = new THREE.Box3().setFromObject(model);
+      const box = computeVisibleBox(model) ?? new THREE.Box3().setFromObject(model);
+      if (!box || box.isEmpty()) return false;
+
       const lift = groundY + GROUND_EPS - box.min.y;
 
       model.position.y += lift;
@@ -493,7 +587,7 @@ gltfLoader.load(
       clearColliders();
       registerCollidersFromObject(model, {
         expand: 0.02,
-        minSize: 0.05,
+        minSize: 0.35,
       });
       console.log("Collider boxes:", getColliderBoxesCount());
     };
@@ -644,11 +738,15 @@ function tick() {
 
       // Resolve collisions with GLB colliders:
       // IMPORTANT: do NOT pass radius/height here, otherwise you override constants.js
+      const yBeforeCollision = controls.object.position.y;
       resolveCollisions(controls.object.position, prevStep, null, {
-        eyeOffset: EYE_HEIGHT, // because controls.object.position is the eye/camera
-        maxIters: 4,
-        skin: 0.01,
+        eyeOffset: EYE_HEIGHT,
+        maxIters: 3,     // was 4 → biraz daha yumuşak
+        skin: 0.03,      // was 0.01 → jitter azalır
       });
+
+      //  Lock Y: collisions only affect XZ (prevents "bouncing" on edges)
+      controls.object.position.y = yBeforeCollision;
 
       // Keep player inside playable bounds
       clampPlayerToTerrainBounds();
