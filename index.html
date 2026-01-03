@@ -16,11 +16,43 @@
       height: 100%;
       display: block;
     }
+    /* Loading overlay */
+    #loading-overlay {
+      position: fixed;
+      left: 0;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      background: linear-gradient(180deg, #0b1220 0%, #081021 100%);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #fff;
+      font-family: sans-serif;
+      z-index: 10000;
+      flex-direction: column;
+    }
+    #loading-overlay .label { font-size: 18px; margin-bottom: 12px; }
+    #loading-overlay .bar { position: relative; width: 420px; height: 18px; background: rgba(255,255,255,0.06); border-radius: 10px; overflow: hidden; }
+    #loading-overlay .bar > .fill { height: 100%; background: linear-gradient(90deg,#7bdcff,#1e88ff); width: 0%; transition: width 240ms linear; }
+    /* Needle indicator */
+    #loading-needle { position: absolute; top: -28px; left: 0; width: 14px; height: 36px; pointer-events: none; transform-origin: 50% 80%; transition: transform 160ms linear; }
+    #loading-needle .head { width: 14px; height: 14px; background: #ffdc4d; border-radius: 50%; margin: -8px auto 0; box-shadow: 0 4px 8px rgba(0,0,0,0.5); }
   </style>
 </head>
 <body>
   <!-- Canvas -->
   <canvas id="webgl-canvas"></canvas>
+
+  <div id="loading-overlay">
+    <div class="label"><span id="loading-text">0%</span></div>
+    <div class="bar">
+      <div class="fill" id="loading-fill"></div>
+      <div id="loading-needle" aria-hidden="true">
+        <div class="head"></div>
+      </div>
+    </div>
+  </div>
 
   <script type="importmap">
   {

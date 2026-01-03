@@ -19,7 +19,7 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { createAbiskoTerrain } from "./src/environment/abiskoTerrain.js";
 import { addLights } from "./src/environment/lights.js";
 import { createSunShadowFollower } from "./src/environment/shadows.js";
-import { loadHDRI, transitionHDRI } from "./src/environment/hdri.js";
+import { loadHDRI, transitionHDRI, preloadAll, preloadHDRI } from "./src/environment/hdri.js";
 import { placeModelsOnTerrain } from "./src/environment/modelPlacer.js";
 import Snow from "./src/environment/snow.js";
 
@@ -129,7 +129,47 @@ const shadowFollower = createSunShadowFollower(sun, scene, {
 
 const pmrem = new THREE.PMREMGenerator(renderer);
 pmrem.compileEquirectangularShader();
-loadHDRI("./assets/skybox/hdr/sunlight_4k.exr", scene, pmrem);
+// Show loading overlay immediately
+function _setLoading(pct, txt) {
+  try {
+    const el = document.getElementById("loading-fill");
+    const t = document.getElementById("loading-text");
+    if (el) el.style.width = Math.max(0, Math.min(100, pct)) + "%";
+    if (t && typeof txt !== "undefined") t.innerText = txt;
+    else if (t) t.innerText = Math.round(pct) + "%";
+    // move & rotate needle indicator
+    try {
+      const needle = document.getElementById("loading-needle");
+      const bar = el?.parentElement;
+      if (needle && bar) {
+        const barRect = bar.getBoundingClientRect();
+        const pctClamped = Math.max(0, Math.min(100, pct)) / 100;
+        const travel = Math.max(0, barRect.width - needle.offsetWidth);
+        const x = Math.round(travel * pctClamped);
+        // move horizontally
+        needle.style.transform = `translateX(${x}px) rotate(${pctClamped * 180}deg)`;
+      }
+    } catch (e) {}
+  } catch (e) {}
+}
+
+function _hideLoading() {
+  try { const o = document.getElementById("loading-overlay"); if (o) o.style.display = "none"; } catch(e){}
+}
+
+_setLoading(5, "Initializing...");
+
+// preload the initial HDRI so scene background is ready
+preloadHDRI("./assets/skybox/hdr/sunlight_4k.exr", pmrem)
+  .then(() => {
+    loadHDRI("./assets/skybox/hdr/sunlight_4k.exr", scene, pmrem);
+    _setLoading(15, "Loading sky...");
+  })
+  .catch(() => {
+    // fallback: try immediate load
+    loadHDRI("./assets/skybox/hdr/sunlight_4k.exr", scene, pmrem);
+    _setLoading(10, "Loading sky...");
+  });
 
 // HDRI switching: entries can include metadata (presets, weight, time range).
 // Selection modes supported: 'sequence' | 'shuffle' | 'weighted' | 'time'
@@ -183,6 +223,11 @@ function pickNextIndex() {
   return (currentHdriIndex + 1) % hdriEntries.length;
 }
 
+// Start background preloading of all HDRIs into PMREM cache (non-blocking).
+preloadAll(hdriEntries, pmrem).then(() => {
+  console.log("All HDRIs preloaded into PMREM cache.");
+});
+
 function setHdriIndex(idx) {
   currentHdriIndex = ((idx % hdriEntries.length) + hdriEntries.length) % hdriEntries.length;
   const entry = hdriEntries[currentHdriIndex];
@@ -195,13 +240,76 @@ function setHdriIndex(idx) {
   });
 }
 
-window.addEventListener("keydown", (e) => {
-  if (e.code === "KeyH") {
-    const next = pickNextIndex();
-    setHdriIndex(next);
+// --- HDRI switching guard + accelerated game time HUD ---
+let isHdriTransitioning = false;
+// game time in seconds since midnight
+let gameTimeSeconds = new Date().getHours() * 3600 + new Date().getMinutes() * 60;
+// timeScale: how many in-game seconds pass per real second. Increase to speed up.
+let timeScale = 900; // 1 real second = 10 in-game minutes by default
+
+function requestSetHdriIndex(idx) {
+  if (isHdriTransitioning) return false;
+  const entry = hdriEntries[((idx % hdriEntries.length) + hdriEntries.length) % hdriEntries.length];
+  const duration = (entry?.preset?.duration ?? 2000);
+  isHdriTransitioning = true;
+  setHdriIndex(idx);
+  setTimeout(() => {
+    isHdriTransitioning = false;
+  }, duration + 120);
+  return true;
+}
+
+function requestHdriNext() {
+  const next = pickNextIndex();
+  if (!requestSetHdriIndex(next)) {
+    console.log("HDRI transition busy, ignoring request");
+  } else {
     console.log("Switched HDRI to", hdriEntries[currentHdriIndex].id || hdriEntries[currentHdriIndex].path);
   }
-});
+}
+
+// window.addEventListener("keydown", (e) => {
+//   if (e.code === "KeyH") {
+//     requestHdriNext();
+//   }
+// });
+
+// create small clock HUD in top-right
+const _createClockHud = () => {
+  const el = document.createElement("div");
+  el.id = "game-clock";
+  el.style.position = "fixed";
+  el.style.top = "10px";
+  el.style.right = "14px";
+  el.style.padding = "6px 10px";
+  el.style.background = "rgba(0,0,0,0.5)";
+  el.style.color = "#fff";
+  el.style.fontFamily = "monospace";
+  el.style.fontSize = "14px";
+  el.style.borderRadius = "6px";
+  el.style.zIndex = "9999";
+  el.style.pointerEvents = "none";
+  document.body.appendChild(el);
+  return el;
+};
+
+const clockHud = _createClockHud();
+
+function _formatTime(sec) {
+  const s = Math.floor(sec % 60);
+  const m = Math.floor((sec / 60) % 60);
+  const h = Math.floor((sec / 3600) % 24);
+  return String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0");
+}
+
+function _desiredHdriForHour(hour) {
+  // mapping: day -> sun (0), sunset -> sunset (1), aurora -> aurora2/3 (2/4), night -> dark (3)
+  if (hour >= 10 && hour < 17) return 0; // day
+  if (hour >= 17 && hour < 20) return 1; // sunset
+  if (hour >= 6 && hour < 10) return 4; // morning aurora-ish
+  // night
+  return 3;
+}
 
 // ------------------------------------------------------------
 // Snow particle system
@@ -390,6 +498,7 @@ function createOuterTerrain(
 // ------------------------------------------------------------
 (async () => {
   try {
+    _setLoading(30, "Loading terrain...");
     terrain = await createAbiskoTerrain({
       heightUrl: assetUrl("/assets/terrain/height_1km_2m_16bit.png"),
       slopeUrl: assetUrl("/assets/terrain/slope_deg.png"),
@@ -428,6 +537,7 @@ function createOuterTerrain(
       }
     }
 
+    _setLoading(60, "Placing models...");
     // Place models
     try {
       await placeModelsOnTerrain(
@@ -464,7 +574,7 @@ function createOuterTerrain(
           },
           {
             path: "./assets/models/sledge.glb",
-            count: 1,
+            count: 10,
             minSpacing: 20.0,
             scaleRange: [0.1, 0.2],
             targetHeight: 10,
@@ -494,7 +604,7 @@ function createOuterTerrain(
             count: 1,
             minSpacing: 20.0,
             scaleRange: [0.1, 0.2],
-            targetHeight: 70,
+            targetHeight: 50,
             alignToNormal: false,
             yOffset: -0.3,
           }
@@ -507,6 +617,15 @@ function createOuterTerrain(
     } catch (e) {
       console.warn("placeModelsOnTerrain failed:", e);
     }
+
+    // initial loading done — hide overlay after a short delay
+    try {
+      _setLoading(95, "Finalizing...");
+      setTimeout(() => {
+        _setLoading(100, "Ready");
+        setTimeout(_hideLoading, 220);
+      }, 220);
+    } catch (e) {}
 
     // Spawn player safely above terrain at (0,0)
     const y0 = getGroundY(0, 0);
@@ -784,6 +903,20 @@ function tick() {
   }
 
   if (snow) snow.update(dt);
+
+  // advance in-game time (accelerated) and update HUD
+  try {
+    gameTimeSeconds += dt * timeScale;
+    gameTimeSeconds = gameTimeSeconds % (24 * 3600);
+    const hour = Math.floor((gameTimeSeconds / 3600) % 24);
+    const desired = _desiredHdriForHour(hour);
+    if (desired !== currentHdriIndex) {
+      requestSetHdriIndex(desired);
+    }
+    if (typeof clockHud !== "undefined" && clockHud) clockHud.innerText = _formatTime(gameTimeSeconds);
+  } catch (e) {}
+
+  if (window.sledgeController) window.sledgeController.update(dt);
   renderer.render(scene, camera);
 }
 
