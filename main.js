@@ -22,6 +22,8 @@ import { createSunShadowFollower } from "./src/environment/shadows.js";
 import { loadHDRI, transitionHDRI, preloadAll, preloadHDRI } from "./src/environment/hdri.js";
 import { placeModelsOnTerrain } from "./src/environment/modelPlacer.js";
 import { createCampfireController } from "./src/environment/campfire.js";
+import { createFootstepController } from "./src/player/footsteps.js";
+import { createMusicController } from "./src/audio/music.js";
 import Snow from "./src/environment/snow.js";
 
 import {
@@ -105,7 +107,32 @@ scene.add(controls.object);
 
 document.addEventListener("click", () => {
   if (!controls.isLocked) controls.lock();
+  try {
+    if (musicController) musicController.start();
+  } catch (e) {}
 });
+// Footsteps controller (plays while player moves)
+let footstepController = null;
+try {
+  footstepController = createFootstepController({
+    camera,
+    audioUrl: assetUrl("./assets/sounds/steps-in-snow.wav"),
+    volume: 1.0,
+  });
+} catch (e) {
+  console.warn("createFootstepController failed:", e);
+}
+
+// Background music controller (HTMLAudioElement fallback for .flac)
+let musicController = null;
+try {
+  musicController = createMusicController({
+    audioUrl: assetUrl("./assets/sounds/arctic_sound.flac"),
+    volume: 0.12,
+  });
+} catch (e) {
+  console.warn("createMusicController failed:", e);
+}
 
 // ------------------------------------------------------------
 // Lighting + shadow follower
@@ -924,6 +951,15 @@ function tick() {
     controls.object.getWorldDirection(camDir);
 
     shadowFollower.update(playerGroundPos, camDir);
+
+    // Footstep sound: play when horizontally moving and grounded
+    try {
+      if (footstepController) {
+        const horizSpeedNow = Math.hypot(velocity.x, velocity.z);
+        const isMoving = horizSpeedNow > 0.6 && grounded; // threshold: 0.6 m/s
+        footstepController.setMoving(isMoving);
+      }
+    } catch (e) {}
 
   }
 
