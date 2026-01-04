@@ -22,6 +22,8 @@ import { createSunShadowFollower } from "./src/environment/shadows.js";
 import { loadHDRI, transitionHDRI, preloadAll, preloadHDRI } from "./src/environment/hdri.js";
 import { placeModelsOnTerrain } from "./src/environment/modelPlacer.js";
 import { createCampfireController } from "./src/environment/campfire.js";
+import { createSledgeController } from "./src/environment/sledge.js";
+
 import { createFootstepController } from "./src/player/footsteps.js";
 import { createMusicController } from "./src/audio/music.js";
 import { createFenceForBounds } from "./src/environment/fence.js";
@@ -105,6 +107,8 @@ const EDGE_BUFFER = 0.0;
 // ------------------------------------------------------------
 const controls = new PointerLockControls(camera, renderer.domElement);
 scene.add(controls.object);
+
+try { window.scene = scene; window.controls = controls; window.camera = camera; } catch (e) {}
 
 document.addEventListener("click", () => {
   if (!controls.isLocked) controls.lock();
@@ -642,14 +646,13 @@ function createOuterTerrain(
           },
           {
             path: "./assets/models/wooden_sledge.glb",
-            count: 1,
+            count: 20,
             minSpacing: 20.0,
             scaleRange: [0.1, 0.2],
             targetHeight: 50,
             alignToNormal: false,
-            yOffset: -0.3,
-          }
-          ,
+            yOffset: -3.6,
+          },
           {
             path: "./assets/models/campfire.glb",
             name: "campfire",
@@ -676,6 +679,13 @@ function createOuterTerrain(
       campfireController = createCampfireController({ scene, controls, range: 6.0 });
     } catch (e) {
       console.warn("createCampfireController failed:", e);
+    }
+
+    // Initialize sledge controller (handles mounting and sliding)
+    try {
+      window.sledgeController = createSledgeController({ scene, controls, range: 6.0, slideDuration: 6.0, slideSpeed: 28.0, heightOffset: 3.0, groundSampler: getGroundY, minAboveGround: EYE_HEIGHT + 0.2, maxBaseOffset: 3.0 });
+    } catch (e) {
+      console.warn("createSledgeController failed:", e);
     }
 
     // initial loading done — hide overlay after a short delay

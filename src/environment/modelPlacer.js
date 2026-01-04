@@ -107,7 +107,21 @@ export async function placeModelsOnTerrain(scene, terrainMesh, entries = [], opt
   const terrainSize = terrainMesh.userData.terrainSizeM ?? 260;
   const half = terrainSize * 0.5;
 
-  // ✅ GLOBAL: tüm modeller için tek havuz
+  // fence avoidance: collect positions of fence children (posts/rails)
+  const fenceAvoidDistance = options.fenceAvoidDistance ?? 6.0;
+  const fencePositions = [];
+  try {
+    scene.traverse((o) => {
+      if (!o.parent) return;
+      if (o.parent.name === "Fence" || o.name === "Fence") {
+        const wp = new THREE.Vector3();
+        o.getWorldPosition(wp);
+        fencePositions.push({ x: wp.x, z: wp.z });
+      }
+    });
+  } catch (e) {}
+
+  // GLOBAL
   const allPlaced = []; // { x, z, minR, box, path }
 
   const isFreeByDistance = (x, z, reqR) => {
@@ -180,6 +194,15 @@ export async function placeModelsOnTerrain(scene, terrainMesh, entries = [], opt
     const slopeThreshold = Math.cos((maxSlopeDeg * Math.PI) / 180.0);
 
     const tryPlaceAt = (x, z, overrides = {}) => {
+      // reject if too close to fence
+      try {
+        for (const p of fencePositions) {
+          const dx = p.x - x;
+          const dz = p.z - z;
+          if (dx * dx + dz * dz < fenceAvoidDistance * fenceAvoidDistance) return false;
+        }
+      } catch (e) {}
+
       const y = terrainMesh.userData.getHeightAt(x, z);
       if (y == null) return false;
 
@@ -257,6 +280,16 @@ export async function placeModelsOnTerrain(scene, terrainMesh, entries = [], opt
       }
 
       // accept
+      // expose source path and ensure sledges are named so controllers can find them
+      try {
+        instance.userData = instance.userData || {};
+        instance.userData.sourcePath = path;
+        if (/sledge|sled/i.test(path)) {
+          instance.userData.isSledge = true;
+          // also set a helpful name so controllers/hit-tests can match
+          instance.name = instance.name || "sledge";
+        }
+      } catch (e) {}
       scene.add(instance);
       if (addColliders) {
         registerCollidersFromObject(instance, {

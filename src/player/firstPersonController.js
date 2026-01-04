@@ -39,11 +39,11 @@ export class FirstPersonController {
   spawnAt(x, z) {
     const g = this.groundSampler(x, z, 0);
     this.lastGroundY = g;
-    this.controls.getObject().position.set(x, g + PLAYER.EYE_HEIGHT, z);
+    this.controls.object.position.set(x, g + PLAYER.EYE_HEIGHT, z);
   }
 
   update(dt) {
-    const player = this.controls.getObject();
+    const player = this.controls.object;
     this.prevPlayerPos.copy(player.position);
 
     this.updateMovement(dt);
@@ -68,7 +68,7 @@ export class FirstPersonController {
   }
 
   clampPitch() {
-    const pitchObject = this.controls.getObject().children[0];
+    const pitchObject = this.controls.object.children[0];
     if (!pitchObject) return;
 
     const maxPitch = THREE.MathUtils.degToRad(MOVEMENT.LOOK_MAX_PITCH);
