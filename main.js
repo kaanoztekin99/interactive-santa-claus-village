@@ -21,6 +21,7 @@ import { addLights } from "./src/environment/lights.js";
 import { createSunShadowFollower } from "./src/environment/shadows.js";
 import { loadHDRI, transitionHDRI, preloadAll, preloadHDRI } from "./src/environment/hdri.js";
 import { placeModelsOnTerrain } from "./src/environment/modelPlacer.js";
+import { createCampfireController } from "./src/environment/campfire.js";
 import Snow from "./src/environment/snow.js";
 
 import {
@@ -122,6 +123,8 @@ const shadowFollower = createSunShadowFollower(sun, scene, {
   far: 2500,
   snap: 5,
 });
+
+let campfireController = null;
 
 // ------------------------------------------------------------
 // HDRI (use constants.js) - robust URL resolution
@@ -608,6 +611,18 @@ function createOuterTerrain(
             alignToNormal: false,
             yOffset: -0.3,
           }
+          ,
+          {
+            path: "./assets/models/campfire.glb",
+            name: "campfire",
+            count: 3,
+            minSpacing: 6.0,
+            scaleRange: [0.5, 0.9],
+            targetHeight: 1.0,
+            alignToNormal: false,
+            positions: [{ x: 8, z: -6, yawDeg: 0, scale: 1 }],
+            yOffset: -3.5,
+          }
         ],
         {
           seed: "LAPLAND-v1",
@@ -616,6 +631,13 @@ function createOuterTerrain(
       );
     } catch (e) {
       console.warn("placeModelsOnTerrain failed:", e);
+    }
+
+    // Initialize modular campfire controller
+    try {
+      campfireController = createCampfireController({ scene, controls, range: 6.0 });
+    } catch (e) {
+      console.warn("createCampfireController failed:", e);
     }
 
     // initial loading done — hide overlay after a short delay
@@ -755,12 +777,15 @@ window.addEventListener("keyup", (e) => {
 // ------------------------------------------------------------
 // Movement + physics
 // ------------------------------------------------------------
+
+const clock = new THREE.Clock();
+
+// Movement vectors
 const velocity = new THREE.Vector3();
 const dir = new THREE.Vector3();
 const forward = new THREE.Vector3();
 const right = new THREE.Vector3();
 const move = new THREE.Vector3();
-const clock = new THREE.Clock();
 
 const prevPos = new THREE.Vector3();
 const prevStep = new THREE.Vector3();
@@ -917,6 +942,10 @@ function tick() {
   } catch (e) {}
 
   if (window.sledgeController) window.sledgeController.update(dt);
+  try {
+    if (campfireController) campfireController.update(dt);
+  } catch (e) {}
+
   renderer.render(scene, camera);
 }
 
