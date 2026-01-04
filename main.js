@@ -24,6 +24,7 @@ import { placeModelsOnTerrain } from "./src/environment/modelPlacer.js";
 import { createCampfireController } from "./src/environment/campfire.js";
 import { createFootstepController } from "./src/player/footsteps.js";
 import { createMusicController } from "./src/audio/music.js";
+import { createFenceForBounds } from "./src/environment/fence.js";
 import Snow from "./src/environment/snow.js";
 
 import {
@@ -540,6 +541,16 @@ function createOuterTerrain(
 
     terrainReady = true;
     computeTerrainBoundsXZ();
+
+    // Add a visual fence around the playable bounds
+    try {
+      if (terrainXZ) {
+        const fence = createFenceForBounds(terrainXZ, { postSpacing: 4.0, postHeight: 1.2, heightSampler: terrain.userData?.getHeightAt });
+        if (fence) scene.add(fence);
+      }
+    } catch (e) {
+      console.warn("create fence failed:", e);
+    }
 
     outerTerrain = createOuterTerrain(terrain, terrainXZ, {
       sizeMultiplier: OUTER_SIZE_MULTIPLIER,
