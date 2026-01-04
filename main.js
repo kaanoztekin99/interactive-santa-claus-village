@@ -50,6 +50,19 @@ function assetUrl(p) {
 // Renderer / Scene / Camera
 // ------------------------------------------------------------
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+console.log("[DEBUG] maxTextureSize:", renderer.capabilities.maxTextureSize);
+console.log("[DEBUG] maxSamples:", renderer.capabilities.maxSamples);
+setInterval(() => {
+  const i = renderer.info;
+  console.log(
+    "[DEBUG] calls:", i.render.calls,
+    "tri:", i.render.triangles,
+    "points:", i.render.points,
+    "lines:", i.render.lines,
+    "geoms:", i.memory.geometries,
+    "tex:", i.memory.textures
+  );
+}, 2000);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 
@@ -67,7 +80,6 @@ scene.background = new THREE.Color(0x8fb9ff);
 
 // Very light fog
 scene.fog = new THREE.FogExp2(new THREE.Color(0x8fb9ff), 0.00011);
-
 const camera = new THREE.PerspectiveCamera(
   60,
   window.innerWidth / window.innerHeight,
@@ -141,11 +153,11 @@ try {
 const { sun } = addLights(scene, {
   hemiIntensity: 0.35,
   sunIntensity: 1.2,
-  shadowMapSize: 2048,
+  shadowMapSize: 1024,
 });
 
 const shadowFollower = createSunShadowFollower(sun, scene, {
-  radius: 350,
+  radius: 220,
   sunOffset: new THREE.Vector3(-300, 600, 200),
   near: 1,
   far: 2500,
@@ -594,6 +606,7 @@ function createOuterTerrain(
             maxSlopeDeg: 30,
             alignToNormal: false,
             yOffset: -0.12,
+            colliderMode: "bounds",
           },
           {
             path: "./assets/models/no_leaf_tree.glb",
@@ -604,6 +617,7 @@ function createOuterTerrain(
             maxSlopeDeg: 35,
             alignToNormal: false,
             yOffset: -0.12,
+            colliderMode: "bounds",
           },
           {
             path: "./assets/models/snowy_fallen_tree.glb",
@@ -612,6 +626,7 @@ function createOuterTerrain(
             scaleRange: [0.8, 1.1],
             targetHeight: 100,
             alignToNormal: false,
+            colliderMode: "bounds",
           },
           {
             path: "./assets/models/sledge.glb",
@@ -621,6 +636,7 @@ function createOuterTerrain(
             targetHeight: 10,
             alignToNormal: false,
             yOffset: -0.3,
+            colliderMode: "bounds",
           },
           {
             path: "./assets/models/poly.glb",
@@ -629,6 +645,7 @@ function createOuterTerrain(
             scaleRange: [0.1, 0.2],
             targetHeight: 100,
             alignToNormal: false,
+            colliderMode: "bounds",
           },
           {
             path: "./assets/models/santas_workshop_lapland_finland.glb",
@@ -639,6 +656,7 @@ function createOuterTerrain(
             alignToNormal: false,
             yOffset: -0.02,
             positions: [{ x: 120, z: -480, yawDeg: 35 }],
+            colliderMode: "perMesh",
           },
           {
             path: "./assets/models/wooden_sledge.glb",
@@ -648,8 +666,8 @@ function createOuterTerrain(
             targetHeight: 50,
             alignToNormal: false,
             yOffset: -0.3,
-          }
-          ,
+            colliderMode: "bounds",
+          },
           {
             path: "./assets/models/campfire.glb",
             name: "campfire",
@@ -660,6 +678,7 @@ function createOuterTerrain(
             alignToNormal: false,
             positions: [{ x: 8, z: -6, yawDeg: 0, scale: 1 }],
             yOffset: -3.5,
+            colliderMode: "perMesh",
           }
         ],
         {
@@ -667,10 +686,10 @@ function createOuterTerrain(
           overlapMode: "bbox",
         }
       );
+      console.log("[DEBUG] Colliders after placement:", getColliderBoxesCount());
     } catch (e) {
       console.warn("placeModelsOnTerrain failed:", e);
     }
-
     // Initialize modular campfire controller
     try {
       campfireController = createCampfireController({ scene, controls, range: 6.0 });
@@ -768,7 +787,7 @@ gltfLoader.load(
         expand: 0.02,
         minSize: 0.35,
       });
-      console.log("Collider boxes:", getColliderBoxesCount());
+      console.log("[DEBUG] Colliders after VillageModel:", getColliderBoxesCount());
     };
 
     const finalize = () => {

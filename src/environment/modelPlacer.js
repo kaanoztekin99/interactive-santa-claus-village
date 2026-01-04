@@ -1,7 +1,15 @@
 // src/environment/modelPlacer.js
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
-import { registerCollidersFromObject } from "../collision/colliders.js";
+
+// NOTE:
+// - "perMesh"  => old behavior (adds one Box3 per mesh) (more precise, slower if many)
+// - "bounds"   => one Box3 for the whole instance (fast, good for trees/rocks/props)
+// - "none"     => no collider for this entry
+import {
+  registerCollidersFromObject,
+  registerColliderFromObjectBounds,
+} from "../collision/colliders.js";
 
 const loader = new GLTFLoader();
 const downRay = new THREE.Raycaster();
@@ -22,6 +30,7 @@ function xmur3(str) {
     return (h ^= h >>> 16) >>> 0;
   };
 }
+
 function mulberry32(a) {
   return function () {
     let t = (a += 0x6d2b79f5);
@@ -30,6 +39,7 @@ function mulberry32(a) {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
+
 function makeRng(seed) {
   const s = typeof seed === "string" ? seed : String(seed ?? "default-seed");
   const h = xmur3(s)();
@@ -77,8 +87,8 @@ function computeVisibleBox(root) {
 
 function snapToGroundByVisibleBox(obj, hitY, yOffset = 0) {
   obj.updateMatrixWorld(true);
-  const b = computeVisibleBox(obj) ?? new THREE.Box3().setFromObject(obj);
 
+  const b = computeVisibleBox(obj) ?? new THREE.Box3().setFromObject(obj);
   if (!b || b.isEmpty()) {
     obj.position.y = hitY + yOffset;
     obj.updateMatrixWorld(true);
@@ -90,8 +100,16 @@ function snapToGroundByVisibleBox(obj, hitY, yOffset = 0) {
   obj.updateMatrixWorld(true);
 }
 
-export async function placeModelsOnTerrain(scene, terrainMesh, entries = [], options = {}) {
-  if (!terrainMesh?.userData || typeof terrainMesh.userData.getHeightAt !== "function") {
+export async function placeModelsOnTerrain(
+  scene,
+  terrainMesh,
+  entries = [],
+  options = {}
+) {
+  if (
+    !terrainMesh?.userData ||
+    typeof terrainMesh.userData.getHeightAt !== "function"
+  ) {
     console.warn("placeModelsOnTerrain: invalid terrainMesh");
     return [];
   }
@@ -107,7 +125,7 @@ export async function placeModelsOnTerrain(scene, terrainMesh, entries = [], opt
   const terrainSize = terrainMesh.userData.terrainSizeM ?? 260;
   const half = terrainSize * 0.5;
 
-  // ✅ GLOBAL: tüm modeller için tek havuz
+  // ✅ GLOBAL: tutti i modelli per un unico "pool" per evitare overlap globali
   const allPlaced = []; // { x, z, minR, box, path }
 
   const isFreeByDistance = (x, z, reqR) => {
@@ -131,18 +149,14 @@ export async function placeModelsOnTerrain(scene, terrainMesh, entries = [], opt
     const {
       path,
       name = null,
-
       count = 10,
       minSpacing = 4.0,
       maxAttemptsPerItem = 80,
-
       targetHeight = null,
       scaleRange = [1, 1],
-
       yawRange = [0, 360],
       maxSlopeDeg = 35,
       alignToNormal = true,
-
       yOffset = 0,
 
       // fixed replacements
@@ -151,7 +165,13 @@ export async function placeModelsOnTerrain(scene, terrainMesh, entries = [], opt
 
       addColliders = true,
       colliderMinSize = 0.30,
-      colliderExpand = 0.00,
+      colliderExpand = 0.0,
+
+      // NEW: collider mode per entry
+      // "bounds" (fast) recommended for mass props/trees
+      // "perMesh" for few big/important objects
+      // "none" to skip
+      colliderMode = "bounds",
     } = e;
 
     let gltf;
@@ -163,6 +183,7 @@ export async function placeModelsOnTerrain(scene, terrainMesh, entries = [], opt
     }
 
     const proto = gltf.scene;
+
     proto.traverse((o) => {
       if (o.isMesh) {
         o.castShadow = true;
@@ -186,14 +207,20 @@ export async function placeModelsOnTerrain(scene, terrainMesh, entries = [], opt
       // raycast -> hit point & normal
       downOrigin.set(x, y + 600, z);
       downRay.set(downOrigin, new THREE.Vector3(0, -1, 0));
-      terrainMesh.updateMatrixWorld(true);
 
+      terrainMesh.updateMatrixWorld(true);
       const hits = downRay.intersectObject(terrainMesh, false);
       if (!hits.length) return false;
+
       const hit = hits[0];
 
-      const faceNormal = hit.face?.normal ? hit.face.normal.clone() : new THREE.Vector3(0, 1, 0);
-      const normalMat = new THREE.Matrix3().getNormalMatrix(terrainMesh.matrixWorld);
+      const faceNormal = hit.face?.normal
+        ? hit.face.normal.clone()
+        : new THREE.Vector3(0, 1, 0);
+
+      const normalMat = new THREE.Matrix3().getNormalMatrix(
+        terrainMesh.matrixWorld
+      );
       const normalWorld = faceNormal.applyMatrix3(normalMat).normalize();
 
       // slope gate
@@ -222,32 +249,43 @@ export async function placeModelsOnTerrain(scene, terrainMesh, entries = [], opt
         if (desiredTargetHeight != null && protoHeight > 1e-6) {
           finalScale = (desiredTargetHeight / protoHeight) * randScaleFactor;
         }
+
         if (scaleMul != null) finalScale *= scaleMul;
       }
+
       instance.scale.setScalar(finalScale);
 
       // rotation
       if (alignToNormal) {
         const up = new THREE.Vector3(0, 1, 0);
-        instance.quaternion.copy(new THREE.Quaternion().setFromUnitVectors(up, normalWorld));
+        instance.quaternion.copy(
+          new THREE.Quaternion().setFromUnitVectors(up, normalWorld)
+        );
       }
+
       const fixedYaw = overrides.yawDeg ?? null;
-      const yawDeg = fixedYaw != null ? fixedYaw : randRange(rng, yawRange[0], yawRange[1]);
-      instance.rotateOnAxis(new THREE.Vector3(0, 1, 0), THREE.MathUtils.degToRad(yawDeg));
+      const yawDeg =
+        fixedYaw != null ? fixedYaw : randRange(rng, yawRange[0], yawRange[1]);
+
+      instance.rotateOnAxis(
+        new THREE.Vector3(0, 1, 0),
+        THREE.MathUtils.degToRad(yawDeg)
+      );
 
       // place high then snap by bbox
       instance.position.set(x, hit.point.y + 200, z);
       instance.updateMatrixWorld(true);
 
       const yOff = overrides.yOffsetOverride ?? yOffset;
-
       // only yOffset
       snapToGroundByVisibleBox(instance, hit.point.y, yOff);
+
       if (terrainMesh.userData.getSnowLiftAt) {
         const snowLift = terrainMesh.userData.getSnowLiftAt(x, z);
         instance.position.y += snowLift;
         instance.updateMatrixWorld(true);
       }
+
       // overlap check
       const b = computeVisibleBox(instance) ?? new THREE.Box3().setFromObject(instance);
       if (!b || b.isEmpty()) return false;
@@ -258,39 +296,61 @@ export async function placeModelsOnTerrain(scene, terrainMesh, entries = [], opt
 
       // accept
       scene.add(instance);
+
       if (addColliders) {
-        registerCollidersFromObject(instance, {
-          minSize: colliderMinSize,
-          expand: colliderExpand,
-        });
+        if (colliderMode === "none") {
+          // skip
+        } else if (colliderMode === "perMesh") {
+          // old behavior (more precise, can be expensive if many)
+          registerCollidersFromObject(instance, {
+            minSize: colliderMinSize,
+            expand: colliderExpand,
+          });
+        } else {
+          // default: one collider per instance (fast)
+          registerColliderFromObjectBounds(instance, {
+            minSize: colliderMinSize,
+            expand: colliderExpand,
+          });
+        }
       }
 
       allPlaced.push({ x, z, minR: reqR, box: b, path });
       return true;
     };
 
-    // Fixed positions first 
+    // Fixed positions first
     if (Array.isArray(positions) && positions.length > 0) {
       let placedCount = 0;
+
       for (let i = 0; i < Math.min(count, positions.length); i++) {
         const p = positions[i];
-
         const x = p.x ?? p[0];
         const z = p.z ?? p[1];
         if (x == null || z == null) continue;
 
         const ok = tryPlaceAt(x, z, {
-          yawDeg: typeof p.yawDeg === "number" ? p.yawDeg : (typeof p.yaw === "number" ? p.yaw : null),
+          yawDeg:
+            typeof p.yawDeg === "number"
+              ? p.yawDeg
+              : typeof p.yaw === "number"
+                ? p.yaw
+                : null,
           scale: typeof p.scale === "number" ? p.scale : null,
           scaleMul: typeof p.scaleMul === "number" ? p.scaleMul : null,
-          targetHeightOverride: typeof p.targetHeight === "number" ? p.targetHeight : null,
+          targetHeightOverride:
+            typeof p.targetHeight === "number" ? p.targetHeight : null,
           yOffsetOverride: typeof p.yOffset === "number" ? p.yOffset : null,
-          minSpacingOverride: typeof p.minSpacing === "number" ? p.minSpacing : null,
+          minSpacingOverride:
+            typeof p.minSpacing === "number" ? p.minSpacing : null,
         });
 
         if (ok) placedCount++;
       }
-      console.log(`Placed ${placedCount}/${count} instances of ${path} (fixed positions)`);
+
+      console.log(
+        `Placed ${placedCount}/${count} instances of ${path} (fixed positions)`
+      );
       continue; // skip random placement
     }
 
