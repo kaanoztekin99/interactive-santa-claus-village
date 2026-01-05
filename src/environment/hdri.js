@@ -1,24 +1,34 @@
-// Loads the EXR skybox and assigns it as both background and environment map.
+// src/environment/hdri.js
+// Loads the EXR skybox and assigns:
+// - original EXR texture as background (the actual "photo")
+// - PMREM as environment (lighting)
+
 import * as THREE from "three";
 import { EXRLoader } from "three/addons/loaders/EXRLoader.js";
 
-// Simple in-memory cache for PMREM-generated envMaps
-const _cache = new Map(); // path -> THREE.Texture (PMREM envMap)
+// path -> { bg: THREE.Texture, env: THREE.Texture }
+const _cache = new Map();
 
 export function preloadHDRI(path, pmremGenerator) {
   if (_cache.has(path)) return Promise.resolve(_cache.get(path));
+
   return new Promise((resolve, reject) => {
     const loader = new EXRLoader();
-    loader.setDataType(THREE.FloatType);
+    loader.setDataType(THREE.HalfFloatType);
+
     loader.load(
       path,
       (texture) => {
         texture.mapping = THREE.EquirectangularReflectionMapping;
+
         const envMap = pmremGenerator.fromEquirectangular(texture).texture;
-        _cache.set(path, envMap);
-        texture.dispose();
+
+        // IMPORTANT: keep the original texture for background (do NOT dispose it)
+        const pair = { bg: texture, env: envMap };
+        _cache.set(path, pair);
+
         console.log("Preloaded HDRI:", path);
-        resolve(envMap);
+        resolve(pair);
       },
       undefined,
       (err) => {
@@ -31,34 +41,33 @@ export function preloadHDRI(path, pmremGenerator) {
 
 export function preloadAll(entries, pmremGenerator) {
   const paths = entries.map((e) => (typeof e === "string" ? e : e.path));
-  const promises = paths.map((p) => preloadHDRI(p, pmremGenerator).catch((_) => null));
-  return Promise.all(promises);
+  return Promise.all(paths.map((p) => preloadHDRI(p, pmremGenerator).catch(() => null)));
 }
 
 export function loadHDRI(path, scene, pmremGenerator) {
-  // Use cache if available
   if (_cache.has(path)) {
-    scene.background = _cache.get(path);
-    scene.environment = _cache.get(path);
+    const { bg, env } = _cache.get(path);
+    scene.background = bg;      // <-- photo
+    scene.environment = env;    // <-- lighting
     console.log("HDRI used from cache:", path);
     return;
   }
 
   const loader = new EXRLoader();
-  loader.setDataType(THREE.FloatType);
+  loader.setDataType(THREE.HalfFloatType);
 
   loader.load(
     path,
     (texture) => {
       texture.mapping = THREE.EquirectangularReflectionMapping;
+
       const envMap = pmremGenerator.fromEquirectangular(texture).texture;
 
-      scene.background = envMap;
-      scene.environment = envMap;
+      scene.background = texture;   // <-- photo
+      scene.environment = envMap;   // <-- lighting
 
-      _cache.set(path, envMap);
+      _cache.set(path, { bg: texture, env: envMap });
 
-      texture.dispose();
       console.log("HDRI loaded:", path);
     },
     undefined,
@@ -67,47 +76,65 @@ export function loadHDRI(path, scene, pmremGenerator) {
 }
 
 export function transitionHDRI(path, scene, pmremGenerator, renderer, opts = {}) {
-  const { sun = null, duration = 2000, targetExposure = 1.0, targetSunIntensity = 1.0 } = opts;
+  const {
+    sun = null,
+    duration = 2000,
+    targetExposure = 1.0,
+    targetSunIntensity = 1.0,
+  } = opts;
 
   const loader = new EXRLoader();
-  loader.setDataType(THREE.FloatType);
+  loader.setDataType(THREE.HalfFloatType);
 
   const startExposure = renderer.toneMappingExposure ?? 1.0;
   const startSun = sun ? sun.intensity : null;
 
   const half = Math.max(50, duration / 2);
-
   const t0 = performance.now();
+
   function fadeOut(now) {
-    const dt = now - t0;
-    const p = Math.min(1, dt / half);
-    renderer.toneMappingExposure = THREE.MathUtils.lerp(startExposure, Math.min(0.05, targetExposure * 0.25), p);
-    if (sun && startSun != null) sun.intensity = THREE.MathUtils.lerp(startSun, Math.max(0.05, targetSunIntensity * 0.15), p);
+    const p = Math.min(1, (now - t0) / half);
+
+    // keep a floor so it doesn't go pure black too aggressively
+    renderer.toneMappingExposure = THREE.MathUtils.lerp(startExposure, Math.max(0.15, targetExposure * 0.4), p);
+
+    if (sun && startSun != null) {
+      sun.intensity = THREE.MathUtils.lerp(startSun, Math.max(0.05, targetSunIntensity * 0.2), p);
+    }
+
     if (p < 1) requestAnimationFrame(fadeOut);
     else loadAndFadeIn();
   }
 
-  function loadAndFadeIn() {
-    // if cached, swap immediately
-    if (_cache.has(path)) {
-      scene.background = _cache.get(path);
-      scene.environment = _cache.get(path);
-      console.log("HDRI transition used cached envMap:", path);
+  function applyPair(pair, cachedLabel) {
+    if (scene.environment !== pair.env)  scene.environment = pair.env;   // <-- lighting
+    if (scene.background !== pair.bg)  scene.background = pair.bg;     // <-- photo
 
-      const t1 = performance.now();
-      function fadeIn(now) {
-        const dt = now - t1;
-        const p = Math.min(1, dt / half);
-        renderer.toneMappingExposure = THREE.MathUtils.lerp(renderer.toneMappingExposure, targetExposure, p);
-        if (sun && startSun != null) sun.intensity = THREE.MathUtils.lerp(sun.intensity, targetSunIntensity, p);
-        if (p < 1) requestAnimationFrame(fadeIn);
-        else {
-          renderer.toneMappingExposure = targetExposure;
-          if (sun && startSun != null) sun.intensity = targetSunIntensity;
-          console.log("HDRI transition complete (cached):", path);
-        }
+    console.log("HDRI transition swap:", cachedLabel, path);
+
+    const t1 = performance.now();
+    function fadeIn(now) {
+      const p = Math.min(1, (now - t1) / half);
+
+      renderer.toneMappingExposure = THREE.MathUtils.lerp(renderer.toneMappingExposure, targetExposure, p);
+      if (sun && startSun != null) {
+        sun.intensity = THREE.MathUtils.lerp(sun.intensity, targetSunIntensity, p);
       }
-      requestAnimationFrame(fadeIn);
+
+      if (p < 1) requestAnimationFrame(() => requestAnimationFrame(fadeIn));
+      else {
+        renderer.toneMappingExposure = targetExposure;
+        if (sun && startSun != null) sun.intensity = targetSunIntensity;
+        console.log("HDRI transition complete:", path);
+      }
+    }
+    requestAnimationFrame(() => requestAnimationFrame(fadeIn));
+
+  }
+
+  function loadAndFadeIn() {
+    if (_cache.has(path)) {
+      applyPair(_cache.get(path), "cached");
       return;
     }
 
@@ -115,29 +142,12 @@ export function transitionHDRI(path, scene, pmremGenerator, renderer, opts = {})
       path,
       (texture) => {
         texture.mapping = THREE.EquirectangularReflectionMapping;
+
         const envMap = pmremGenerator.fromEquirectangular(texture).texture;
+        const pair = { bg: texture, env: envMap };
 
-        scene.background = envMap;
-        scene.environment = envMap;
-        _cache.set(path, envMap);
-
-        texture.dispose();
-
-        const t1 = performance.now();
-        function fadeIn(now) {
-          const dt = now - t1;
-          const p = Math.min(1, dt / half);
-          renderer.toneMappingExposure = THREE.MathUtils.lerp(renderer.toneMappingExposure, targetExposure, p);
-          if (sun && startSun != null) sun.intensity = THREE.MathUtils.lerp(sun.intensity, targetSunIntensity, p);
-          if (p < 1) requestAnimationFrame(fadeIn);
-          else {
-            renderer.toneMappingExposure = targetExposure;
-            if (sun && startSun != null) sun.intensity = targetSunIntensity;
-            console.log("HDRI transition complete (loaded):", path);
-          }
-        }
-
-        requestAnimationFrame(fadeIn);
+        _cache.set(path, pair);
+        applyPair(pair, "loaded");
       },
       undefined,
       (err) => console.error("Error loading EXR HDRI:", err)
