@@ -1,11 +1,56 @@
 // src/environment/modelPlacer.js
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
-import { registerCollidersFromObject } from "../collision/colliders.js";
+import { registerColliderBox } from "../collision/colliders.js";
 
 const loader = new GLTFLoader();
 const downRay = new THREE.Raycaster();
 const downOrigin = new THREE.Vector3();
+
+// ------------------------------------------------------------
+// Shadow LOD: enable/disable shadow casting/receiving based on distance to player
+// Shadow LOD optimized: keep a flat list of meshes to update
+// ------------------------------------------------------------
+const _shadowLODMeshes = []; // { mesh, castDistance, receiveDistance }
+const _tmpShadowV = new THREE.Vector3();
+
+export function registerShadowLODGroup(root, opts = {}) {
+  const castDistance = opts.castDistance ?? 22;
+  const receiveDistance = opts.receiveDistance ?? 30;
+
+  root.traverse((o) => {
+    if (!o.isMesh) return;
+
+    o.castShadow = false;
+    o.receiveShadow = false;
+
+    // store directly into a flat list (faster than traverse later)
+    _shadowLODMeshes.push({
+      mesh: o,
+      castDistance,
+      receiveDistance,
+    });
+  });
+}
+
+export function updateShadowLODAll(playerPos) {
+  for (let i = 0; i < _shadowLODMeshes.length; i++) {
+    const it = _shadowLODMeshes[i];
+    const m = it.mesh;
+
+    // If removed from scene later, skip
+    if (!m.parent) continue;
+
+    m.getWorldPosition(_tmpShadowV);
+    const d = _tmpShadowV.distanceTo(playerPos);
+
+    const shouldCast = d <= it.castDistance;
+    const shouldReceive = d <= it.receiveDistance;
+
+    if (m.castShadow !== shouldCast) m.castShadow = shouldCast;
+    if (m.receiveShadow !== shouldReceive) m.receiveShadow = shouldReceive;
+  }
+}
 
 /* ---------------------------
  * Seeded RNG (deterministic)
@@ -140,7 +185,7 @@ export async function placeModelsOnTerrain(scene, terrainMesh, entries = [], opt
     }
     return true;
   };
-
+  terrainMesh.updateMatrixWorld(true);
   for (const e of entries) {
     const {
       path,
@@ -165,7 +210,7 @@ export async function placeModelsOnTerrain(scene, terrainMesh, entries = [], opt
 
       addColliders = true,
       colliderMinSize = 0.30,
-      colliderExpand = 0.00,
+      colliderExpand = 0.03,
     } = e;
 
     let gltf;
@@ -176,13 +221,15 @@ export async function placeModelsOnTerrain(scene, terrainMesh, entries = [], opt
       continue;
     }
 
-    const proto = gltf.scene;
-    proto.traverse((o) => {
-      if (o.isMesh) {
-        o.castShadow = true;
-        o.receiveShadow = true;
-      }
-    });
+  const proto = gltf.scene;
+
+  // not cast/receive shadows by default
+  // we'll enable them later via LOD system if needed
+  proto.traverse((o) => {
+    if (!o.isMesh) return;
+    o.castShadow = false;
+    o.receiveShadow = false;
+  });
 
     // proto height for targetHeight scaling
     proto.updateMatrixWorld(true);
@@ -209,7 +256,6 @@ export async function placeModelsOnTerrain(scene, terrainMesh, entries = [], opt
       // raycast -> hit point & normal
       downOrigin.set(x, y + 600, z);
       downRay.set(downOrigin, new THREE.Vector3(0, -1, 0));
-      terrainMesh.updateMatrixWorld(true);
 
       const hits = downRay.intersectObject(terrainMesh, false);
       if (!hits.length) return false;
@@ -229,7 +275,7 @@ export async function placeModelsOnTerrain(scene, terrainMesh, entries = [], opt
       // instance
       const instance = proto.clone(true);
       if (name) instance.name = name;
-
+      registerShadowLODGroup(instance, { castDistance: 25, receiveDistance: 70 });
       // scale
       const desiredTargetHeight = overrides.targetHeightOverride ?? targetHeight;
       const manualScale = overrides.scale ?? null; // absolute scalar
@@ -262,15 +308,19 @@ export async function placeModelsOnTerrain(scene, terrainMesh, entries = [], opt
       instance.position.set(x, hit.point.y + 200, z);
       instance.updateMatrixWorld(true);
 
-      const yOff = overrides.yOffsetOverride ?? yOffset;
+     const yOff = overrides.yOffsetOverride ?? yOffset;
+     let snowLift = 0;
 
-      // only yOffset
-      snapToGroundByVisibleBox(instance, hit.point.y, yOff);
-      if (terrainMesh.userData.getSnowLiftAt) {
-        const snowLift = terrainMesh.userData.getSnowLiftAt(x, z);
-        instance.position.y += snowLift;
-        instance.updateMatrixWorld(true);
-      }
+     // snap to ground using visible bbox + yOffset
+     snapToGroundByVisibleBox(instance, hit.point.y, yOff);
+
+     // optional snow lift (store it in our variable, no "const snowLift" shadowing!)
+     if (terrainMesh.userData.getSnowLiftAt) {
+       snowLift = terrainMesh.userData.getSnowLiftAt(x, z) || 0;
+       instance.position.y += snowLift;
+       instance.updateMatrixWorld(true);
+     }
+
       // overlap check
       const b = computeVisibleBox(instance) ?? new THREE.Box3().setFromObject(instance);
       if (!b || b.isEmpty()) return false;
@@ -292,10 +342,13 @@ export async function placeModelsOnTerrain(scene, terrainMesh, entries = [], opt
       } catch (e) {}
       scene.add(instance);
       if (addColliders) {
-        registerCollidersFromObject(instance, {
-          minSize: colliderMinSize,
-          expand: colliderExpand,
-        });
+        // reuse 'b' computed above
+        const cbox = b.clone();
+
+        const groundY = hit.point.y + yOff + snowLift;
+        cbox.min.y = Math.max(cbox.min.y, groundY + 0.02);
+
+        registerColliderBox(cbox, { expand: colliderExpand ?? 0.03, minSize: colliderMinSize });
       }
 
       allPlaced.push({ x, z, minR: reqR, box: b, path });

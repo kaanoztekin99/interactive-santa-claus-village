@@ -21,6 +21,30 @@ import { PLAYER } from "../config/constants.js";
 const colliderBoxes = [];
 
 /**
+ * Register a single AABB collider (already in world space).
+ * Much cheaper than traversing all meshes for every instance.
+ */
+export function registerColliderBox(box, opts = {}) {
+  const expand = opts.expand ?? 0.02;   // tiny skin for stability (NOT player radius)
+  const minSize = opts.minSize ?? 0.02;
+
+  if (!box || box.isEmpty()) return;
+
+  const b = box.clone();
+
+  if (expand > 0) b.expandByScalar(expand);
+
+  // Size gate (use min side, not diagonal)
+  const size = new THREE.Vector3();
+  b.getSize(size);
+  const minSide = Math.min(size.x, size.y, size.z);
+  if (minSide < minSize) return;
+
+  colliderBoxes.push(b);
+}
+
+
+/**
  * Optional helper: clear existing colliders (useful when reloading scenes).
  */
 export function clearColliders() {
@@ -81,9 +105,6 @@ export function getColliderBoxesCount() {
 // Collision resolution (player capsule/cylinder vs AABBs)
 // ------------------------------------------------------------
 
-const _closest = new THREE.Vector3();
-const _delta = new THREE.Vector3();
-const _tmp = new THREE.Vector3();
 
 /**
  * Push player out of an AABB in XZ.
