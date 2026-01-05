@@ -2,20 +2,23 @@
 //
 // FPS movement (PointerLockControls) + terrain height clamp + GLB collisions.
 //
-// Key change for collisions:
-// - colliders.js reads PLAYER defaults from src/config/constants.js
-// - so main.js should NOT override radius/height when calling resolveCollisions()
-//   (we only pass eyeOffset because our player position is the camera/eye position)
+// Big picture:
+// - We render a snowy Lapland terrain with props, a village GLB, animals, and a sky HDRI cycle.
+// - Player is FPS-style (pointer lock), with gravity + jump + snap-to-ground.
+// - Collisions: AABB based, managed by src/collision/colliders.js
+// - HDRI: background uses the original EXR texture, lighting uses PMREM env map.
+// - Snow: GPU Points layer, performance-scaled depending on whether we’re in aurora mode.
 //
-// Fixes in this version:
-// 1) Jump works while moving/running (stable grounded detection via snap-to-ground).
-// 2) No "queued jump" from mid-air (SPACE only triggers if grounded now).
-// 3) HDRI / assets paths resolved robustly via import.meta.url.
+// Important performance note (the reason you saw "time slowing down"):
+// - If you advance game time using dt from THREE.Clock, the game clock *slows down*
+//   whenever the framerate drops (because dt is tied to frame time).
+// - We switch the *time system* to real wall-clock time via performance.now(),
+//   so the day/night cycle continues at the same speed even during heavy frames.
 //
-// NEW (animals):
-// - deer/moose loaded separately so animations (idle) are always played
-// - auto-scale to target height, and place on ground using bbox bottom
-// - ONE cheap collider box per animal, without wiping other colliders
+// Another important note:
+// - If an exception happens inside your time/HDRI loop, it can stop updates for HUD & HDRI.
+//   The “snow.setCount is not a function” error did exactly that.
+//   So: we implement those methods in Snow.js and still code defensively.
 
 import * as THREE from "three";
 import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
@@ -48,6 +51,11 @@ const canvas = document.querySelector("#webgl-canvas");
 
 // ------------------------------------------------------------
 // Robust asset URL helper
+//
+// Why this exists:
+// - In dev servers / bundlers, relative paths can behave differently.
+// - new URL(..., import.meta.url) gives you a stable absolute URL
+//   that works with Vite and similar setups.
 // ------------------------------------------------------------
 function assetUrl(p) {
   return new URL(p.replace(/^\//, "./"), import.meta.url).href;
@@ -57,6 +65,9 @@ function assetUrl(p) {
 // Renderer / Scene / Camera
 // ------------------------------------------------------------
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+
+// Pixel ratio is a sneaky GPU killer.
+// 1.25 is a nice compromise: sharper than 1.0, less brutal than full devicePixelRatio.
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.25));
 renderer.setSize(window.innerWidth, window.innerHeight);
 
@@ -65,7 +76,9 @@ renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.0;
 
 renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.shadowMap.type = THREE.PCFShadowMap;
+
+console.log("MAX_TEXTURE_SIZE:", renderer.capabilities.maxTextureSize);
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x8fb9ff);
@@ -78,17 +91,24 @@ camera.position.set(0, 120, 180);
 // Player tuning
 // ------------------------------------------------------------
 const EYE_HEIGHT = PLAYER?.EYE_HEIGHT ?? 1.7;
+
 let camDir = new THREE.Vector3();
 
+// Walk/run are tuned “game style”, not “real meters per second”.
+// Keep them as you like. The collision/step splitting below makes it stable.
 const WALK_SPEED = 18.0;
 const RUN_SPEED = 30.0;
+
 const GRAVITY = 30.0;
 const JUMP_VELOCITY = 9.0;
 
 const GROUND_SNAP_DIST = 0.08;
 const GROUND_EPS = 0.03;
 
+// When moving fast, we split motion into smaller steps.
+// This reduces tunneling through colliders.
 const MAX_STEP = 0.8;
+
 const EDGE_BUFFER = 0.0;
 
 // ------------------------------------------------------------
@@ -97,6 +117,7 @@ const EDGE_BUFFER = 0.0;
 const controls = new PointerLockControls(camera, renderer.domElement);
 scene.add(controls.object);
 
+// Expose a few globals for quick debugging in DevTools.
 try {
   window.scene = scene;
   window.controls = controls;
@@ -110,7 +131,9 @@ document.addEventListener("click", () => {
   } catch (e) {}
 });
 
-// Footsteps controller
+// ------------------------------------------------------------
+// Audio
+// ------------------------------------------------------------
 let footstepController = null;
 try {
   footstepController = createFootstepController({
@@ -122,7 +145,6 @@ try {
   console.warn("createFootstepController failed:", e);
 }
 
-// Background music controller
 let musicController = null;
 try {
   musicController = createMusicController({
@@ -158,13 +180,13 @@ let campfireController = null;
 const mixers = [];
 const anchoredActors = []; // { obj, baseOffsetY, extraLift }
 
-
 // ------------------------------------------------------------
 // HDRI
 // ------------------------------------------------------------
 const pmrem = new THREE.PMREMGenerator(renderer);
 pmrem.compileEquirectangularShader();
 
+// Loading overlay helpers (UI only)
 function _setLoading(pct, txt) {
   try {
     const el = document.getElementById("loading-fill");
@@ -173,6 +195,7 @@ function _setLoading(pct, txt) {
     if (t && typeof txt !== "undefined") t.innerText = txt;
     else if (t) t.innerText = Math.round(pct) + "%";
 
+    // Tiny gimmick needle (pure UI candy)
     try {
       const needle = document.getElementById("loading-needle");
       const bar = el?.parentElement;
@@ -196,6 +219,8 @@ function _hideLoading() {
 
 _setLoading(5, "Initializing...");
 
+// Start with daylight HDRI fast, then preload everything else in background.
+// That way you see something immediately.
 preloadHDRI("./assets/skybox/hdr/sunlight_4k.exr", pmrem)
   .then(() => {
     loadHDRI("./assets/skybox/hdr/sunlight_4k.exr", scene, pmrem);
@@ -207,11 +232,11 @@ preloadHDRI("./assets/skybox/hdr/sunlight_4k.exr", pmrem)
   });
 
 const hdriEntries = [
-  { id: "sun", path: "./assets/skybox/hdr/sunlight_4k.exr", preset: { targetExposure: 1.0, targetSunIntensity: 1.2 } },
-  { id: "sunset", path: "./assets/skybox/hdr/sunset_10k.exr", preset: { targetExposure: 0.7, targetSunIntensity: 0.45 } },
-  { id: "aurora2", path: "./assets/skybox/hdr/aurora_v2.exr", preset: { targetExposure: 0.5, targetSunIntensity: 0.25 } },
-  { id: "dark", path: "./assets/skybox/hdr/dark_8k.exr", preset: { targetExposure: 0.25, targetSunIntensity: 0.08 } },
-  { id: "aurora3", path: "./assets/skybox/hdr/aurora_v3.exr", preset: { targetExposure: 0.6, targetSunIntensity: 0.35 } },
+  { id: "sun",     path: "./assets/skybox/hdr/sunlight_4k.exr", preset: { targetExposure: 1.0, targetSunIntensity: 1.2 } },
+  { id: "sunset",  path: "./assets/skybox/hdr/sunset_4k.exr",   preset: { targetExposure: 0.7, targetSunIntensity: 0.45 } },
+  { id: "aurora2", path: "./assets/skybox/hdr/aurora_v2_4k.exr",preset: { targetExposure: 0.5, targetSunIntensity: 0.25 } },
+  { id: "dark",    path: "./assets/skybox/hdr/dark_4k.exr",     preset: { targetExposure: 0.25, targetSunIntensity: 0.08 } },
+  { id: "aurora3", path: "./assets/skybox/hdr/aurora_v3_4k.exr",preset: { targetExposure: 0.6, targetSunIntensity: 0.35 } },
 ];
 
 let currentHdriIndex = 0;
@@ -221,31 +246,41 @@ function setHdriIndex(idx) {
   currentHdriIndex = ((idx % hdriEntries.length) + hdriEntries.length) % hdriEntries.length;
   const entry = hdriEntries[currentHdriIndex];
   const opts = entry.preset ?? {};
+
   transitionHDRI(entry.path, scene, pmrem, renderer, {
-    sun: sun,
+    sun,
     duration: opts.duration ?? 2000,
     targetExposure: opts.targetExposure ?? 1.0,
     targetSunIntensity: opts.targetSunIntensity ?? 1.0,
   });
 }
 
+// A simple gate so we don't spam HDRI transitions back-to-back.
 function requestSetHdriIndex(idx) {
   if (isHdriTransitioning) return false;
+
   const entry = hdriEntries[((idx % hdriEntries.length) + hdriEntries.length) % hdriEntries.length];
   const duration = entry?.preset?.duration ?? 2000;
+
   isHdriTransitioning = true;
   setHdriIndex(idx);
+
+  // Just a tiny extra buffer after the transition.
   setTimeout(() => {
     isHdriTransitioning = false;
   }, duration + 120);
+
   return true;
 }
 
+// Preload all HDRIs so later transitions are mostly just swapping cached textures.
 preloadAll(hdriEntries, pmrem).then(() => {
   console.log("All HDRIs preloaded into PMREM cache.");
 });
 
-// clock HUD
+// ------------------------------------------------------------
+// Clock HUD (top-right small overlay)
+// ------------------------------------------------------------
 const _createClockHud = () => {
   const el = document.createElement("div");
   el.id = "game-clock";
@@ -272,15 +307,25 @@ function _formatTime(sec) {
   return String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0");
 }
 
+// Decide which HDRI should be active for a given in-game hour.
+// (This is intentionally simple; you can make it fancier later.)
 function _desiredHdriForHour(hour) {
-  if (hour >= 10 && hour < 17) return 0;
-  if (hour >= 17 && hour < 20) return 1;
-  if (hour >= 6 && hour < 10) return 4;
-  return 3;
+  if (hour >= 10 && hour < 17) return 0; // sun
+  if (hour >= 17 && hour < 20) return 1; // sunset
+  if (hour >= 6 && hour < 10)  return 4; // aurora3 / early morning vibe
+  return 3; // dark
 }
 
+// In-game time starts from your real local clock (nice for debugging).
 let gameTimeSeconds = new Date().getHours() * 3600 + new Date().getMinutes() * 60;
+
+// timeScale: how fast a day passes.
+// 900 means: 1 real second = 900 game seconds = 15 in-game minutes.
 let timeScale = 900;
+
+// Real time accumulator anchor.
+// performance.now() is monotonic-ish and not tied to frame dt.
+let _lastRealNow = performance.now() * 0.001;
 
 // ------------------------------------------------------------
 // Snow
@@ -291,7 +336,24 @@ let snow = new Snow(scene, {
   speed: 18,
   texturePath: assetUrl("./assets/textures/snowflake-svgrepo-com.svg"),
   wind: new THREE.Vector3(3, 0, 1),
+
+  // NEW: throttle particle CPU updates slightly by default
+  updateHz: 30,
+
+  // NormalBlending is cheaper than Additive and looks more like real snow.
+  blending: THREE.NormalBlending,
 });
+
+// Small debug peek (optional)
+console.log("snow methods:", {
+  setCount: typeof snow.setCount,
+  setSize: typeof snow.setSize,
+  setUpdateHz: typeof snow.setUpdateHz,
+});
+
+// We'll only apply snow quality changes when the mode actually flips,
+// otherwise you end up reallocating buffers or touching state every frame for no reason.
+let _snowAuroraMode = null;
 
 // ------------------------------------------------------------
 // Terrain
@@ -301,7 +363,6 @@ let terrainReady = false;
 let terrainXZ = null;
 let outerTerrain = null;
 
-// Outer terrain knobs
 const OUTER_SIZE_MULTIPLIER = 4.0;
 const OUTER_SEGMENTS = 160;
 const OUTER_NOISE_AMPLITUDE_M = 1.2;
@@ -331,8 +392,16 @@ function clampPlayerToTerrainBounds() {
   const playerRadius = PLAYER?.RADIUS ?? 0.45;
   const margin = EDGE_BUFFER + playerRadius + 0.05;
 
-  controls.object.position.x = THREE.MathUtils.clamp(controls.object.position.x, terrainXZ.minX + margin, terrainXZ.maxX - margin);
-  controls.object.position.z = THREE.MathUtils.clamp(controls.object.position.z, terrainXZ.minZ + margin, terrainXZ.maxZ - margin);
+  controls.object.position.x = THREE.MathUtils.clamp(
+    controls.object.position.x,
+    terrainXZ.minX + margin,
+    terrainXZ.maxX - margin
+  );
+  controls.object.position.z = THREE.MathUtils.clamp(
+    controls.object.position.z,
+    terrainXZ.minZ + margin,
+    terrainXZ.maxZ - margin
+  );
 }
 
 function lowFreqNoise2D(x, z) {
@@ -389,6 +458,8 @@ function createOuterTerrain(innerTerrain, bounds, { sizeMultiplier = OUTER_SIZE_
     const mesh = new THREE.Mesh(geom, outerMat);
     mesh.receiveShadow = true;
     mesh.castShadow = false;
+
+    // Render slightly behind inner terrain
     mesh.renderOrder = -1;
 
     mesh.position.set((x0 + x1) * 0.5, 0, (z0 + z1) * 0.5);
@@ -438,8 +509,12 @@ function computeVisibleBox(root) {
     if (!b) return;
 
     const wb = b.clone().applyMatrix4(o.matrixWorld);
-    if (!has) { box.copy(wb); has = true; }
-    else box.union(wb);
+    if (!has) {
+      box.copy(wb);
+      has = true;
+    } else {
+      box.union(wb);
+    }
   });
 
   return has ? box : null;
@@ -453,7 +528,6 @@ function autoScaleToHeight(root, targetHeightM) {
   const size = new THREE.Vector3();
   box.getSize(size);
   const h = size.y;
-
   if (!Number.isFinite(h) || h < 1e-6) return 1.0;
 
   const s = targetHeightM / h;
@@ -467,7 +541,7 @@ function placeOnGroundByBBox(root, x, z, extraLift = 0.08) {
   root.updateMatrixWorld(true);
 
   const box = new THREE.Box3().setFromObject(root);
-  if (!box || box.isEmpty()) { 
+  if (!box || box.isEmpty()) {
     const baseOffsetY = 0;
     const gy = getGroundY(x, z);
     if (gy != null) root.position.y = gy + extraLift + baseOffsetY;
@@ -476,8 +550,8 @@ function placeOnGroundByBBox(root, x, z, extraLift = 0.08) {
   }
 
   const baseOffsetY = -box.min.y;
-
   const gy = getGroundY(x, z);
+
   if (gy == null) {
     console.warn("placeOnGroundByBBox: groundY null at", x, z);
     root.position.y = baseOffsetY;
@@ -489,7 +563,6 @@ function placeOnGroundByBBox(root, x, z, extraLift = 0.08) {
   root.updateMatrixWorld(true);
   return baseOffsetY;
 }
-
 
 async function loadAnimatedActor({
   path,
@@ -509,7 +582,7 @@ async function loadAnimatedActor({
   const actor = gltf.scene;
   actor.name = name || actor.name || "actor";
 
-  // Shadows
+  // Shadows: we keep animals mostly as receivers to avoid heavy shadow maps
   actor.traverse((obj) => {
     if (!obj.isMesh) return;
     obj.castShadow = false;
@@ -517,24 +590,18 @@ async function loadAnimatedActor({
   });
   registerShadowLODGroup(actor, { castDistance, receiveDistance });
 
-  // Rotate
   actor.rotation.y = THREE.MathUtils.degToRad(yawDeg);
 
-  // Scale to desired height (this fixes “too small”)
   if (Number.isFinite(targetHeightM) && targetHeightM > 0) {
     autoScaleToHeight(actor, targetHeightM);
   }
 
-  // Place on ground using bbox bottom (this fixes “inside snow”)
- const baseOffsetY = placeOnGroundByBBox(actor, x, z, extraLift);
-
-  // register for continue anchoring each frame
+  const baseOffsetY = placeOnGroundByBBox(actor, x, z, extraLift);
   anchoredActors.push({ obj: actor, baseOffsetY, extraLift });
-
 
   scene.add(actor);
 
-  // Collider: ONE AABB per actor
+  // One cheap AABB collider per actor
   try {
     const box = computeVisibleBox(actor) ?? new THREE.Box3().setFromObject(actor);
     if (box && !box.isEmpty()) {
@@ -546,7 +613,7 @@ async function loadAnimatedActor({
     console.warn("actor collider failed:", name, e);
   }
 
-  // Play idle animation
+  // Idle animation
   if (gltf.animations && gltf.animations.length > 0) {
     const mixer = new THREE.AnimationMixer(actor);
     mixers.push(mixer);
@@ -564,9 +631,12 @@ async function loadAnimatedActor({
 // ------------------------------------------------------------
 // Build inner terrain (async), then add outer terrain + models + animals
 // ------------------------------------------------------------
+let terrainXZLocal = null;
+
 (async () => {
   try {
     _setLoading(30, "Loading terrain...");
+
     terrain = await createAbiskoTerrain({
       heightUrl: assetUrl("/assets/terrain/height_1km_2m_16bit.png"),
       slopeUrl: assetUrl("/assets/terrain/slope_deg.png"),
@@ -577,12 +647,12 @@ async function loadAnimatedActor({
     scene.add(terrain);
 
     terrainReady = true;
-    computeTerrainBoundsXZ();
+    terrainXZLocal = computeTerrainBoundsXZ();
 
     // Fence
     try {
-      if (terrainXZ) {
-        const fence = createFenceForBounds(terrainXZ, {
+      if (terrainXZLocal) {
+        const fence = createFenceForBounds(terrainXZLocal, {
           postSpacing: 4.0,
           postHeight: 1.2,
           heightSampler: terrain.userData?.getHeightAt,
@@ -594,14 +664,14 @@ async function loadAnimatedActor({
     }
 
     // Outer terrain ring
-    outerTerrain = createOuterTerrain(terrain, terrainXZ, {
+    outerTerrain = createOuterTerrain(terrain, terrainXZLocal, {
       sizeMultiplier: OUTER_SIZE_MULTIPLIER,
       segments: OUTER_SEGMENTS,
       yOffset: OUTER_Y_OFFSET,
     });
     if (outerTerrain) scene.add(outerTerrain);
 
-    // Snow area: inner only
+    // Snow area: set to inner terrain bounds
     if (snow) {
       const box = new THREE.Box3().setFromObject(terrain);
       if (!box.isEmpty()) {
@@ -620,6 +690,7 @@ async function loadAnimatedActor({
     clearColliders();
 
     _setLoading(60, "Placing models...");
+
     // Static props
     try {
       await placeModelsOnTerrain(
@@ -708,11 +779,10 @@ async function loadAnimatedActor({
       console.warn("placeModelsOnTerrain failed:", e);
     }
 
-    // Animals: load separately for animations + correct placement/scale
+    // Animals
     try {
       _setLoading(75, "Loading animals...");
 
-      // deer: ~1.6m tall
       await loadAnimatedActor({
         path: "./assets/models/animated_deer_mr.glb",
         name: "deer",
@@ -723,7 +793,6 @@ async function loadAnimatedActor({
         extraLift: 0.12,
       });
 
-      // moose: ~2.2m tall
       await loadAnimatedActor({
         path: "./assets/models/animated_moose_mr.glb",
         name: "moose",
@@ -761,12 +830,12 @@ async function loadAnimatedActor({
       console.warn("createSledgeController failed:", e);
     }
 
-    // Spawn player
+    // Spawn player slightly above ground so you don't start clipped
     const y0 = getGroundY(0, 0);
     const safeY = (y0 ?? 0) + EYE_HEIGHT + 5.0;
     controls.object.position.set(0, safeY, 0);
 
-    // Loading overlay
+    // Hide loading overlay
     try {
       _setLoading(95, "Finalizing...");
       setTimeout(() => {
@@ -875,11 +944,18 @@ let _shadowFrame = 0;
 function tick() {
   requestAnimationFrame(tick);
 
+  // dt is still used for movement/physics/snow animation.
+  // For the *day/night clock*, we’ll use real time below.
   const dt = Math.min(clock.getDelta(), 0.033);
 
+  // ------------------------------------------------------------
+  // Player update only when pointer lock is active
+  // (so you can click out without the world continuing to shove you around)
+  // ------------------------------------------------------------
   if (controls.isLocked) {
     prevPos.copy(controls.object.position);
 
+    // --- gather input ---
     dir.set(0, 0, 0);
     if (keys.has("KeyW")) dir.z += 1;
     if (keys.has("KeyS")) dir.z -= 1;
@@ -889,21 +965,28 @@ function tick() {
     const hasMoveInput = dir.lengthSq() > 1e-8;
     if (hasMoveInput) dir.normalize();
 
+    // --- camera forward/right vectors on XZ plane ---
     controls.object.getWorldDirection(forward);
     forward.y = 0;
     if (forward.lengthSq() > 1e-8) forward.normalize();
 
     right.crossVectors(forward, new THREE.Vector3(0, 1, 0)).normalize();
 
-    move.set(0, 0, 0).addScaledVector(forward, dir.z).addScaledVector(right, dir.x);
+    // --- convert WASD into world movement direction ---
+    move.set(0, 0, 0)
+      .addScaledVector(forward, dir.z)
+      .addScaledVector(right, dir.x);
+
     if (move.lengthSq() > 1e-8) move.normalize();
 
     const isRunning = hasMoveInput && (keys.has("ShiftLeft") || keys.has("ShiftRight"));
     const speed = isRunning ? RUN_SPEED : WALK_SPEED;
 
+    // Horizontal velocity is controlled directly by input (arcade style)
     velocity.x = move.x * speed;
     velocity.z = move.z * speed;
 
+    // Vertical velocity is physics-driven (gravity + jump)
     const px = controls.object.position.x;
     const pz = controls.object.position.z;
     const groundY = getGroundY(px, pz);
@@ -914,6 +997,7 @@ function tick() {
       const minEyeY = groundY + EYE_HEIGHT;
       const distToGround = controls.object.position.y - minEyeY;
 
+      // "snap-to-ground" so small bumps don't cause micro-falling
       if (distToGround <= GROUND_SNAP_DIST && velocity.y <= 0) {
         controls.object.position.y = minEyeY;
         velocity.y = 0;
@@ -923,15 +1007,18 @@ function tick() {
       }
     }
 
+    // jump only if grounded NOW (no queued jump while falling)
     if (jumpPressed && grounded) {
       velocity.y = JUMP_VELOCITY;
       grounded = false;
     }
     jumpPressed = false;
 
+    // gravity only when airborne and terrain exists under you
     if (groundY != null && !grounded) velocity.y -= GRAVITY * dt;
     else if (groundY == null) velocity.y = 0;
 
+    // Split horizontal movement into smaller substeps to avoid tunneling through colliders.
     const horizSpeed = Math.hypot(velocity.x, velocity.z);
     const steps = Math.max(1, Math.ceil((horizSpeed * dt) / MAX_STEP));
     const subDt = dt / steps;
@@ -939,8 +1026,10 @@ function tick() {
     for (let s = 0; s < steps; s++) {
       prevStep.copy(controls.object.position);
 
+      // integrate velocity
       controls.object.position.addScaledVector(velocity, subDt);
 
+      // resolve collisions only in XZ (keep current Y)
       const yBeforeCollision = controls.object.position.y;
       resolveCollisions(controls.object.position, prevStep, null, {
         eyeOffset: EYE_HEIGHT,
@@ -949,8 +1038,10 @@ function tick() {
       });
       controls.object.position.y = yBeforeCollision;
 
+      // clamp to terrain bounds
       clampPlayerToTerrainBounds();
 
+      // vertical clamp to terrain (no sinking)
       const gy = getGroundY(controls.object.position.x, controls.object.position.z);
       if (gy != null) {
         const stepMinEyeY = gy + EYE_HEIGHT;
@@ -964,16 +1055,23 @@ function tick() {
           velocity.y = 0;
         }
       } else {
+        // If we have no terrain height (outside), rollback the step.
         controls.object.position.copy(prevStep);
         velocity.y = 0;
       }
     }
 
+    // Shadow follower uses player's ground position + camera direction
     const gy2 = getGroundY(controls.object.position.x, controls.object.position.z);
-    playerGroundPos.set(controls.object.position.x, gy2 ?? controls.object.position.y - EYE_HEIGHT, controls.object.position.z);
+    playerGroundPos.set(
+      controls.object.position.x,
+      gy2 ?? controls.object.position.y - EYE_HEIGHT,
+      controls.object.position.z
+    );
     controls.object.getWorldDirection(camDir);
     shadowFollower.update(playerGroundPos, camDir);
 
+    // Footsteps: only when moving AND grounded
     try {
       if (footstepController) {
         const horizSpeedNow = Math.hypot(velocity.x, velocity.z);
@@ -983,13 +1081,15 @@ function tick() {
     } catch (e) {}
   }
 
+  // Snow uses dt for motion; Snow.js itself throttles to updateHz internally.
   if (snow) snow.update(dt);
 
-  // update animal animations
+  // Update animal animations
   if (mixers.length) {
     for (let i = 0; i < mixers.length; i++) mixers[i].update(dt);
   }
 
+  // Keep animals anchored to terrain each frame (so they don't float when heights vary)
   if (anchoredActors.length) {
     for (let i = 0; i < anchoredActors.length; i++) {
       const a = anchoredActors[i];
@@ -1006,22 +1106,59 @@ function tick() {
     }
   }
 
-
-  // update time + HUD + HDRI time mapping
+  // ------------------------------------------------------------
+  // TIME + HDRI LOOP (REAL TIME)
+  //
+  // Why this fixes your “timer becomes slower during aurora” problem:
+  // - This uses wall-clock delta from performance.now(), not render dt.
+  // - So even if FPS tanks for 2 seconds, the in-game clock advances by ~2 seconds * timeScale.
+  // - That makes HDRI transitions happen on schedule and keeps the HUD consistent.
+  // ------------------------------------------------------------
   try {
-    gameTimeSeconds += dt * timeScale;
-    gameTimeSeconds = gameTimeSeconds % (24 * 3600);
+    const nowReal = performance.now() * 0.001; // seconds
+    const realDt = Math.min(0.25, Math.max(0, nowReal - _lastRealNow)); // clamp to avoid huge jumps
+    _lastRealNow = nowReal;
+
+    gameTimeSeconds = (gameTimeSeconds + realDt * timeScale) % (24 * 3600);
+
     const hour = Math.floor((gameTimeSeconds / 3600) % 24);
     const desired = _desiredHdriForHour(hour);
-    if (desired !== currentHdriIndex) requestSetHdriIndex(desired);
-    if (clockHud) clockHud.innerText = _formatTime(gameTimeSeconds);
-  } catch (e) {}
 
+    // "aurora mode" means either aurora2 or aurora3 is currently active
+    const isAurora = (currentHdriIndex === 2 || currentHdriIndex === 4);
+
+    // Adjust snow quality only when mode flips (prevents constant state churn)
+    if (_snowAuroraMode !== isAurora) {
+      _snowAuroraMode = isAurora;
+
+      // These numbers are intentionally conservative: lower count + smaller size
+      // reduces overdraw dramatically during bright aurora HDRIs.
+      if (snow) {
+        if (typeof snow.setCount === "function") snow.setCount(isAurora ? 900 : 2500);
+        if (typeof snow.setSize === "function")  snow.setSize(isAurora ? 1.1 : 1.6);
+
+        // Lower update Hz during aurora to reduce CPU load (position updates)
+        if (typeof snow.setUpdateHz === "function") snow.setUpdateHz(isAurora ? 20 : 30);
+      }
+    }
+
+    // Trigger HDRI transition only when needed
+    if (desired !== currentHdriIndex) requestSetHdriIndex(desired);
+
+    // Update HUD text every frame (cheap)
+    if (clockHud) clockHud.innerText = _formatTime(gameTimeSeconds);
+  } catch (e) {
+    // If something goes wrong here, log it, but don't kill the rest of the frame.
+    console.error("TIME/HDRI LOOP ERROR:", e);
+  }
+
+  // Other controllers
   if (window.sledgeController) window.sledgeController.update(dt);
   try {
     if (campfireController) campfireController.update(dt);
   } catch (e) {}
 
+  // Shadow LOD update not every frame (cheap little optimization)
   if ((++_shadowFrame % 10) === 0) updateShadowLODAll(controls.object.position);
 
   renderer.render(scene, camera);
