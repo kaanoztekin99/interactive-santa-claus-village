@@ -788,7 +788,7 @@ let terrainXZLocal = null;
         name: "deer",
         x: 14,
         z: -6,
-        targetHeightM: 1.6,
+        targetHeightM: 4,
         yawDeg: 145,
         extraLift: 0.12,
       });
@@ -798,7 +798,7 @@ let terrainXZLocal = null;
         name: "moose",
         x: -16,
         z: -10,
-        targetHeightM: 2.2,
+        targetHeightM: 4,
         yawDeg: 35,
         extraLift: 0.14,
       });
