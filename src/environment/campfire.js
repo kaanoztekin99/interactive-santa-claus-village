@@ -48,11 +48,23 @@ export function createCampfireController({ scene, controls, range = 6.0 } = {}) 
       campObj.getWorldPosition(worldBase);
       const localTopY = worldTopY - worldBase.y;
 
-      const light = new THREE.PointLight(0xffa550, 1.6, 8, 2);
-      light.position.set(0, localTopY + 0.25, 0);
-      light.castShadow = false;
-      light.intensity = 0.0; // start off
+      // --- Campfire light: make it actually illuminate ~25m in the dark ---
+      const LIGHT_RANGE = 30;     // requested illuminated radius
+      const LIGHT_DECAY = 2.0;    // realistic-ish falloff (2 is common)
+      const BASE_INTENSITY = 30;  // tune this (try 14..28 depending on your fog/exposure)
+
+      // Main point light (strong + warm)
+      const light = new THREE.PointLight(0xffa550, 0.0, LIGHT_RANGE, LIGHT_DECAY);
+      light.position.set(0, localTopY + 0.35, 0);
+      light.castShadow = false;      // keep shadows off for performance
       campObj.add(light);
+
+      // Optional: soft fill light to avoid a harsh "tiny bright dot" look in fog.
+      // This makes the nearby snow/props readable without forcing BASE_INTENSITY to be insane.
+      const fill = new THREE.PointLight(0xffc98a, 0.0, LIGHT_RANGE * 0.55, 1.6);
+      fill.position.set(0, localTopY + 0.65, 0);
+      fill.castShadow = false;
+      campObj.add(fill);
 
       const sprMat = new THREE.SpriteMaterial({
         map: fireTex,
@@ -70,7 +82,17 @@ export function createCampfireController({ scene, controls, range = 6.0 } = {}) 
       sprite.visible = false;
       campObj.add(sprite);
 
-      emitters.push({ obj: campObj, light, sprite, baseIntensity: 1.6, baseScale, tOff: Math.random() * 10, isOn: false });
+      emitters.push({
+        obj: campObj,
+        light,
+        fill,                // <-- NEW
+        sprite,
+        baseIntensity: BASE_INTENSITY,
+        baseFill: BASE_INTENSITY * 0.45,  // <-- NEW (keep it subtle)
+        baseScale,
+        tOff: Math.random() * 10,
+        isOn: false,
+      });
 
       // prompt element
       try {
@@ -149,12 +171,25 @@ export function createCampfireController({ scene, controls, range = 6.0 } = {}) 
       for (const e of emitters) {
         if (!e.isOn) {
           e.light.intensity = 0;
+          if (e.fill) e.fill.intensity = 0;
           if (e.sprite) e.sprite.material.opacity = 0;
           continue;
         }
 
-        const f = 0.8 + 0.45 * Math.sin(nowT * 8.0 + e.tOff) + (Math.random() * 0.12 - 0.06);
-        e.light.intensity = Math.max(0.06, e.baseIntensity * f);
+        // Flicker: less extreme (more believable + stable lighting)
+        const f =
+          0.9 +
+          0.25 * Math.sin(nowT * 7.0 + e.tOff) +
+          0.06 * Math.sin(nowT * 17.0 + e.tOff * 1.7) +
+          (Math.random() * 0.06 - 0.03);
+
+        e.light.intensity = Math.max(0.2, e.baseIntensity * f);
+
+        // Soft fill follows, but calmer
+        if (e.fill) {
+          const ff = 0.95 + 0.10 * Math.sin(nowT * 5.0 + e.tOff);
+          e.fill.intensity = Math.max(0.05, (e.baseFill ?? 0) * ff);
+        }
 
         const s = e.baseScale * (1.0 + 0.12 * Math.sin(nowT * 12.0 + e.tOff));
         if (e.sprite) {
