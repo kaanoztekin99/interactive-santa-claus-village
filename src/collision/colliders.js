@@ -1,139 +1,62 @@
 // src/collision/colliders.js
 // ------------------------------------------------------------
-// Fast-ish player collisions against scene objects.
-// Key idea:
-// - Keep AABBs (cheap), but DO NOT test all AABBs every frame.
-// - Use a simple spatial hash grid on XZ to query only nearby colliders.
-// - Prefer 1 collider per placed object (bounds) instead of 1 per mesh.
+// Realistic-ish player collisions against scene objects.
+//
+// What changed vs your original version:
+// - Before: if player was inside ANY box -> teleport back to previous position.
+// - Now: player is treated like a vertical capsule/cylinder (in practice: circle in XZ + height),
+//        and we PUSH the player out of the collider while allowing sliding along surfaces.
+// - This is much closer to how FPS games feel.
+//
+// Notes / assumptions:
+// - We resolve collisions primarily in XZ (horizontal). Vertical collisions (stairs/ceilings)
+//   are intentionally minimal because your "ground" is the terrain height sampler.
+// - Colliders are still axis-aligned bounding boxes (AABB). That's a good tradeoff:
+//   works for GLB models, fast, and usually "good enough" if you keep minSize filtering.
 // ------------------------------------------------------------
+
 import * as THREE from "three";
 import { PLAYER } from "../config/constants.js";
 
-// -------------------------
-// Collider storage + grid
-// -------------------------
-const colliderBoxes = [];          // array<Box3>
-const grid = new Map();            // key -> array<int> (indices into colliderBoxes)
-
-// Tune this: bigger cells = fewer grid entries but more candidates per query.
-// 8..16m is a good starting range for outdoor scenes.
-let GRID_CELL_SIZE = 12.0;
-
-function cellKey(ix, iz) {
-  return `${ix},${iz}`;
-}
-
-function worldToCell(v) {
-  return Math.floor(v / GRID_CELL_SIZE);
-}
-
-function insertIndexIntoGridForBox(box, idx) {
-  const minX = worldToCell(box.min.x);
-  const maxX = worldToCell(box.max.x);
-  const minZ = worldToCell(box.min.z);
-  const maxZ = worldToCell(box.max.z);
-
-  for (let ix = minX; ix <= maxX; ix++) {
-    for (let iz = minZ; iz <= maxZ; iz++) {
-      const k = cellKey(ix, iz);
-      let arr = grid.get(k);
-      if (!arr) {
-        arr = [];
-        grid.set(k, arr);
-      }
-      arr.push(idx);
-    }
-  }
-}
-
-// -------------------------
-// Public API
-// -------------------------
-export function clearColliders() {
-  colliderBoxes.length = 0;
-  grid.clear();
-}
-
-export function setColliderGridCellSize(meters) {
-  GRID_CELL_SIZE = Math.max(2.0, Number(meters) || 12.0);
-  // NOTE: caller should clear + rebuild colliders after changing this,
-  // otherwise old entries are still mapped with old cell size.
-}
-
-export function getColliderBoxesCount() {
-  return colliderBoxes.length;
-}
-
-export function getColliderGridStats() {
-  return {
-    cellSize: GRID_CELL_SIZE,
-    cells: grid.size,
-    boxes: colliderBoxes.length,
-  };
-}
+const colliderBoxes = [];
 
 /**
- * Register ONE collider box (already in world coords).
+ * Register a single AABB collider (already in world space).
+ * Much cheaper than traversing all meshes for every instance.
  */
 export function registerColliderBox(box, opts = {}) {
-  const expand = opts.expand ?? 0.0;
+  const expand = opts.expand ?? 0.02;   // tiny skin for stability (NOT player radius)
+  const minSize = opts.minSize ?? 0.02;
+
+  if (!box || box.isEmpty()) return;
+
   const b = box.clone();
-  if (expand !== 0) b.expandByScalar(expand);
 
-  const idx = colliderBoxes.length;
+  if (expand > 0) b.expandByScalar(expand);
+
+  // Size gate (use min side, not diagonal)
+  const size = new THREE.Vector3();
+  b.getSize(size);
+  const minSide = Math.min(size.x, size.y, size.z);
+  if (minSide < minSize) return;
+
   colliderBoxes.push(b);
-  insertIndexIntoGridForBox(b, idx);
 }
 
+
 /**
- * Register ONE collider for an object hierarchy: its overall bounds.
- * This is what you want for most placed props/trees (fast).
+ * Optional helper: clear existing colliders (useful when reloading scenes).
  */
-export function registerColliderFromObjectBounds(root, opts = {}) {
-  const {
-    includeInvisible = false,
-    expand = 0.0,
-    minSize = 0.05,
-  } = opts;
-
-  root.updateMatrixWorld(true);
-
-  // If you want "visible only" bounds, keep it simple:
-  // compute bounds from meshes that are visible.
-  const box = new THREE.Box3();
-  let has = false;
-
-  const tmpBox = new THREE.Box3();
-  const tmpSize = new THREE.Vector3();
-
-  root.traverse((obj) => {
-    if (!obj.isMesh) return;
-    if (!includeInvisible && obj.visible === false) return;
-    if (obj.userData && obj.userData.noCollider) return;
-    if ((obj.name || "").toLowerCase().includes("nocollide")) return;
-
-    tmpBox.setFromObject(obj);
-    if (tmpBox.isEmpty()) return;
-
-    if (!has) {
-      box.copy(tmpBox);
-      has = true;
-    } else {
-      box.union(tmpBox);
-    }
-  });
-
-  if (!has || box.isEmpty()) return;
-
-  box.getSize(tmpSize);
-  if (tmpSize.length() < minSize) return;
-
-  registerColliderBox(box, { expand });
+export function clearColliders() {
+  colliderBoxes.length = 0;
 }
 
 /**
- * Legacy function (per-mesh colliders).
- * Keep it for special cases only (e.g., big buildings where bounds is too crude).
+ * Collects AABB colliders from an object hierarchy (e.g., a loaded GLB scene).
+ *
+ * Tips for GLB:
+ * - Mark non-collidable meshes with `mesh.userData.noCollider = true`
+ * - Or name them with "nocollide"
  */
 export function registerCollidersFromObject(root, opts = {}) {
   const {
@@ -167,22 +90,38 @@ export function registerCollidersFromObject(root, opts = {}) {
     tmpBox.getSize(tmpSize);
     if (tmpSize.length() < minSize) return;
 
+    // Expand slightly so the player doesn't "clip" visually into thin surfaces.
     tmpBox.expandByScalar(expand);
 
-    const idx = colliderBoxes.length;
     colliderBoxes.push(tmpBox.clone());
-    insertIndexIntoGridForBox(tmpBox, idx);
   });
 }
 
+export function getColliderBoxesCount() {
+  return colliderBoxes.length;
+}
+
 // ------------------------------------------------------------
-// Collision resolution (player cylinder vs AABBs) + grid query
+// Collision resolution (player capsule/cylinder vs AABBs)
 // ------------------------------------------------------------
+
+
+/**
+ * Push player out of an AABB in XZ.
+ *
+ * playerPos: world position (either eye position or feet position - see opts.eyeOffset)
+ */
 function resolveOneBoxXZ(playerPos, box, radius, height, eyeOffset, skin) {
+  // Compute the vertical span of the player capsule/cylinder.
+  // We only collide with boxes that overlap vertically with the player.
   const feetY = playerPos.y - eyeOffset;
   const headY = feetY + height;
-  if (headY < box.min.y || feetY > box.max.y) return false;
 
+  if (headY < box.min.y || feetY > box.max.y) {
+    return false; // no vertical overlap -> no collision
+  }
+
+  // Closest point on AABB to player's XZ (we don't care about Y here)
   const cx = THREE.MathUtils.clamp(playerPos.x, box.min.x, box.max.x);
   const cz = THREE.MathUtils.clamp(playerPos.z, box.min.z, box.max.z);
 
@@ -191,81 +130,75 @@ function resolveOneBoxXZ(playerPos, box, radius, height, eyeOffset, skin) {
 
   const distSq = dx * dx + dz * dz;
   const r = radius + skin;
+
   if (distSq >= r * r) return false;
 
+  // If we're exactly on the closest point (inside box center line),
+  // choose a stable push direction based on nearest face.
   if (distSq < 1e-12) {
     const toMinX = Math.abs(playerPos.x - box.min.x);
     const toMaxX = Math.abs(box.max.x - playerPos.x);
     const toMinZ = Math.abs(playerPos.z - box.min.z);
     const toMaxZ = Math.abs(box.max.z - playerPos.z);
-    const m = Math.min(toMinX, toMaxX, toMinZ, toMaxZ);
 
-    if (m === toMinX) playerPos.x = box.min.x - r;
-    else if (m === toMaxX) playerPos.x = box.max.x + r;
-    else if (m === toMinZ) playerPos.z = box.min.z - r;
+    const min = Math.min(toMinX, toMaxX, toMinZ, toMaxZ);
+
+    if (min === toMinX) playerPos.x = box.min.x - r;
+    else if (min === toMaxX) playerPos.x = box.max.x + r;
+    else if (min === toMinZ) playerPos.z = box.min.z - r;
     else playerPos.z = box.max.z + r;
 
     return true;
   }
 
+  // Normal case: push out along the radial direction from closest point to player.
   const dist = Math.sqrt(distSq);
-  const push = r - dist;
+  const push = (r - dist);
+
   const nx = dx / dist;
   const nz = dz / dist;
+
   playerPos.x += nx * push;
   playerPos.z += nz * push;
+
   return true;
 }
 
-function queryCandidateIndices(playerPos, radius) {
-  // Query a small neighborhood of cells around player.
-  // Use radius to decide how many cells to check.
-  const r = Math.max(1.0, radius + 1.0);
-  const minX = worldToCell(playerPos.x - r);
-  const maxX = worldToCell(playerPos.x + r);
-  const minZ = worldToCell(playerPos.z - r);
-  const maxZ = worldToCell(playerPos.z + r);
-
-  const out = [];
-  const seen = new Set();
-
-  for (let ix = minX; ix <= maxX; ix++) {
-    for (let iz = minZ; iz <= maxZ; iz++) {
-      const arr = grid.get(cellKey(ix, iz));
-      if (!arr) continue;
-      for (let i = 0; i < arr.length; i++) {
-        const idx = arr[i];
-        if (seen.has(idx)) continue;
-        seen.add(idx);
-        out.push(idx);
-      }
-    }
-  }
-
-  return out;
-}
-
+/**
+ * Resolve collisions against registered collider boxes.
+ *
+ * Backwards compatible signature:
+ *   resolveCollisions(playerPosition, prevPlayerPos, onCollision)
+ *
+ * Extended usage (recommended):
+ *   resolveCollisions(playerPosition, prevPlayerPos, onCollision, {
+ *     radius: 0.45,
+ *     height: 1.8,
+ *     eyeOffset: 1.7,   // if playerPosition is camera/eye
+ *     maxIters: 4,
+ *     skin: 0.01
+ *   })
+ */
 export function resolveCollisions(playerPosition, prevPlayerPos, onCollision, opts = {}) {
   const radius = opts.radius ?? (PLAYER?.RADIUS ?? 0.45);
   const height = opts.height ?? (PLAYER?.HEIGHT ?? 1.8);
-  const eyeOffset = opts.eyeOffset ?? 0.0;
+  const eyeOffset = opts.eyeOffset ?? 0.0; // 0 => playerPosition is feet. Use EYE_HEIGHT if it's eye.
   const maxIters = opts.maxIters ?? 4;
   const skin = opts.skin ?? 0.01;
 
   let collided = false;
 
-  // Only check nearby colliders
-  const candidates = queryCandidateIndices(playerPosition, radius);
-
+  // Multiple iterations help in corners (two boxes at once).
   for (let iter = 0; iter < maxIters; iter++) {
     let anyThisIter = false;
 
-    for (let c = 0; c < candidates.length; c++) {
-      const box = colliderBoxes[candidates[c]];
+    for (let i = 0; i < colliderBoxes.length; i++) {
+      const box = colliderBoxes[i];
       const hit = resolveOneBoxXZ(playerPosition, box, radius, height, eyeOffset, skin);
       if (hit) {
         anyThisIter = true;
         collided = true;
+
         if (onCollision) onCollision(box);
       }
     }
@@ -273,11 +206,9 @@ export function resolveCollisions(playerPosition, prevPlayerPos, onCollision, op
     if (!anyThisIter) break;
   }
 
-  if (
-    !Number.isFinite(playerPosition.x) ||
-    !Number.isFinite(playerPosition.y) ||
-    !Number.isFinite(playerPosition.z)
-  ) {
+  // Safety: if something produced NaN (shouldn't, but GL math can get wild),
+  // revert to previous position.
+  if (!Number.isFinite(playerPosition.x) || !Number.isFinite(playerPosition.y) || !Number.isFinite(playerPosition.z)) {
     playerPosition.copy(prevPlayerPos);
     return true;
   }

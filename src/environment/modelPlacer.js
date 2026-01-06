@@ -1,19 +1,56 @@
 // src/environment/modelPlacer.js
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
-
-// NOTE:
-// - "perMesh"  => old behavior (adds one Box3 per mesh) (more precise, slower if many)
-// - "bounds"   => one Box3 for the whole instance (fast, good for trees/rocks/props)
-// - "none"     => no collider for this entry
-import {
-  registerCollidersFromObject,
-  registerColliderFromObjectBounds,
-} from "../collision/colliders.js";
+import { registerColliderBox } from "../collision/colliders.js";
 
 const loader = new GLTFLoader();
 const downRay = new THREE.Raycaster();
 const downOrigin = new THREE.Vector3();
+
+// ------------------------------------------------------------
+// Shadow LOD: enable/disable shadow casting/receiving based on distance to player
+// Shadow LOD optimized: keep a flat list of meshes to update
+// ------------------------------------------------------------
+const _shadowLODMeshes = []; // { mesh, castDistance, receiveDistance }
+const _tmpShadowV = new THREE.Vector3();
+
+export function registerShadowLODGroup(root, opts = {}) {
+  const castDistance = opts.castDistance ?? 22;
+  const receiveDistance = opts.receiveDistance ?? 30;
+
+  root.traverse((o) => {
+    if (!o.isMesh) return;
+
+    o.castShadow = false;
+    o.receiveShadow = false;
+
+    // store directly into a flat list (faster than traverse later)
+    _shadowLODMeshes.push({
+      mesh: o,
+      castDistance,
+      receiveDistance,
+    });
+  });
+}
+
+export function updateShadowLODAll(playerPos) {
+  for (let i = 0; i < _shadowLODMeshes.length; i++) {
+    const it = _shadowLODMeshes[i];
+    const m = it.mesh;
+
+    // If removed from scene later, skip
+    if (!m.parent) continue;
+
+    m.getWorldPosition(_tmpShadowV);
+    const d = _tmpShadowV.distanceTo(playerPos);
+
+    const shouldCast = d <= it.castDistance;
+    const shouldReceive = d <= it.receiveDistance;
+
+    if (m.castShadow !== shouldCast) m.castShadow = shouldCast;
+    if (m.receiveShadow !== shouldReceive) m.receiveShadow = shouldReceive;
+  }
+}
 
 /* ---------------------------
  * Seeded RNG (deterministic)
@@ -30,7 +67,6 @@ function xmur3(str) {
     return (h ^= h >>> 16) >>> 0;
   };
 }
-
 function mulberry32(a) {
   return function () {
     let t = (a += 0x6d2b79f5);
@@ -39,7 +75,6 @@ function mulberry32(a) {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
-
 function makeRng(seed) {
   const s = typeof seed === "string" ? seed : String(seed ?? "default-seed");
   const h = xmur3(s)();
@@ -87,8 +122,8 @@ function computeVisibleBox(root) {
 
 function snapToGroundByVisibleBox(obj, hitY, yOffset = 0) {
   obj.updateMatrixWorld(true);
-
   const b = computeVisibleBox(obj) ?? new THREE.Box3().setFromObject(obj);
+
   if (!b || b.isEmpty()) {
     obj.position.y = hitY + yOffset;
     obj.updateMatrixWorld(true);
@@ -100,16 +135,8 @@ function snapToGroundByVisibleBox(obj, hitY, yOffset = 0) {
   obj.updateMatrixWorld(true);
 }
 
-export async function placeModelsOnTerrain(
-  scene,
-  terrainMesh,
-  entries = [],
-  options = {}
-) {
-  if (
-    !terrainMesh?.userData ||
-    typeof terrainMesh.userData.getHeightAt !== "function"
-  ) {
+export async function placeModelsOnTerrain(scene, terrainMesh, entries = [], options = {}) {
+  if (!terrainMesh?.userData || typeof terrainMesh.userData.getHeightAt !== "function") {
     console.warn("placeModelsOnTerrain: invalid terrainMesh");
     return [];
   }
@@ -125,7 +152,21 @@ export async function placeModelsOnTerrain(
   const terrainSize = terrainMesh.userData.terrainSizeM ?? 260;
   const half = terrainSize * 0.5;
 
-  // ✅ GLOBAL: tutti i modelli per un unico "pool" per evitare overlap globali
+  // fence avoidance: collect positions of fence children (posts/rails)
+  const fenceAvoidDistance = options.fenceAvoidDistance ?? 6.0;
+  const fencePositions = [];
+  try {
+    scene.traverse((o) => {
+      if (!o.parent) return;
+      if (o.parent.name === "Fence" || o.name === "Fence") {
+        const wp = new THREE.Vector3();
+        o.getWorldPosition(wp);
+        fencePositions.push({ x: wp.x, z: wp.z });
+      }
+    });
+  } catch (e) {}
+
+  // GLOBAL
   const allPlaced = []; // { x, z, minR, box, path }
 
   const isFreeByDistance = (x, z, reqR) => {
@@ -144,19 +185,23 @@ export async function placeModelsOnTerrain(
     }
     return true;
   };
-
+  terrainMesh.updateMatrixWorld(true);
   for (const e of entries) {
     const {
       path,
       name = null,
+
       count = 10,
       minSpacing = 4.0,
       maxAttemptsPerItem = 80,
+
       targetHeight = null,
       scaleRange = [1, 1],
+
       yawRange = [0, 360],
       maxSlopeDeg = 35,
       alignToNormal = true,
+
       yOffset = 0,
 
       // fixed replacements
@@ -165,13 +210,7 @@ export async function placeModelsOnTerrain(
 
       addColliders = true,
       colliderMinSize = 0.30,
-      colliderExpand = 0.0,
-
-      // NEW: collider mode per entry
-      // "bounds" (fast) recommended for mass props/trees
-      // "perMesh" for few big/important objects
-      // "none" to skip
-      colliderMode = "bounds",
+      colliderExpand = 0.03,
     } = e;
 
     let gltf;
@@ -182,14 +221,15 @@ export async function placeModelsOnTerrain(
       continue;
     }
 
-    const proto = gltf.scene;
+  const proto = gltf.scene;
 
-    proto.traverse((o) => {
-      if (o.isMesh) {
-        o.castShadow = true;
-        o.receiveShadow = true;
-      }
-    });
+  // not cast/receive shadows by default
+  // we'll enable them later via LOD system if needed
+  proto.traverse((o) => {
+    if (!o.isMesh) return;
+    o.castShadow = false;
+    o.receiveShadow = false;
+  });
 
     // proto height for targetHeight scaling
     proto.updateMatrixWorld(true);
@@ -201,6 +241,15 @@ export async function placeModelsOnTerrain(
     const slopeThreshold = Math.cos((maxSlopeDeg * Math.PI) / 180.0);
 
     const tryPlaceAt = (x, z, overrides = {}) => {
+      // reject if too close to fence
+      try {
+        for (const p of fencePositions) {
+          const dx = p.x - x;
+          const dz = p.z - z;
+          if (dx * dx + dz * dz < fenceAvoidDistance * fenceAvoidDistance) return false;
+        }
+      } catch (e) {}
+
       const y = terrainMesh.userData.getHeightAt(x, z);
       if (y == null) return false;
 
@@ -208,19 +257,12 @@ export async function placeModelsOnTerrain(
       downOrigin.set(x, y + 600, z);
       downRay.set(downOrigin, new THREE.Vector3(0, -1, 0));
 
-      terrainMesh.updateMatrixWorld(true);
       const hits = downRay.intersectObject(terrainMesh, false);
       if (!hits.length) return false;
-
       const hit = hits[0];
 
-      const faceNormal = hit.face?.normal
-        ? hit.face.normal.clone()
-        : new THREE.Vector3(0, 1, 0);
-
-      const normalMat = new THREE.Matrix3().getNormalMatrix(
-        terrainMesh.matrixWorld
-      );
+      const faceNormal = hit.face?.normal ? hit.face.normal.clone() : new THREE.Vector3(0, 1, 0);
+      const normalMat = new THREE.Matrix3().getNormalMatrix(terrainMesh.matrixWorld);
       const normalWorld = faceNormal.applyMatrix3(normalMat).normalize();
 
       // slope gate
@@ -233,7 +275,7 @@ export async function placeModelsOnTerrain(
       // instance
       const instance = proto.clone(true);
       if (name) instance.name = name;
-
+      registerShadowLODGroup(instance, { castDistance: 25, receiveDistance: 70 });
       // scale
       const desiredTargetHeight = overrides.targetHeightOverride ?? targetHeight;
       const manualScale = overrides.scale ?? null; // absolute scalar
@@ -249,42 +291,35 @@ export async function placeModelsOnTerrain(
         if (desiredTargetHeight != null && protoHeight > 1e-6) {
           finalScale = (desiredTargetHeight / protoHeight) * randScaleFactor;
         }
-
         if (scaleMul != null) finalScale *= scaleMul;
       }
-
       instance.scale.setScalar(finalScale);
 
       // rotation
       if (alignToNormal) {
         const up = new THREE.Vector3(0, 1, 0);
-        instance.quaternion.copy(
-          new THREE.Quaternion().setFromUnitVectors(up, normalWorld)
-        );
+        instance.quaternion.copy(new THREE.Quaternion().setFromUnitVectors(up, normalWorld));
       }
-
       const fixedYaw = overrides.yawDeg ?? null;
-      const yawDeg =
-        fixedYaw != null ? fixedYaw : randRange(rng, yawRange[0], yawRange[1]);
-
-      instance.rotateOnAxis(
-        new THREE.Vector3(0, 1, 0),
-        THREE.MathUtils.degToRad(yawDeg)
-      );
+      const yawDeg = fixedYaw != null ? fixedYaw : randRange(rng, yawRange[0], yawRange[1]);
+      instance.rotateOnAxis(new THREE.Vector3(0, 1, 0), THREE.MathUtils.degToRad(yawDeg));
 
       // place high then snap by bbox
       instance.position.set(x, hit.point.y + 200, z);
       instance.updateMatrixWorld(true);
 
-      const yOff = overrides.yOffsetOverride ?? yOffset;
-      // only yOffset
-      snapToGroundByVisibleBox(instance, hit.point.y, yOff);
+     const yOff = overrides.yOffsetOverride ?? yOffset;
+     let snowLift = 0;
 
-      if (terrainMesh.userData.getSnowLiftAt) {
-        const snowLift = terrainMesh.userData.getSnowLiftAt(x, z);
-        instance.position.y += snowLift;
-        instance.updateMatrixWorld(true);
-      }
+     // snap to ground using visible bbox + yOffset
+     snapToGroundByVisibleBox(instance, hit.point.y, yOff);
+
+     // optional snow lift (store it in our variable, no "const snowLift" shadowing!)
+     if (terrainMesh.userData.getSnowLiftAt) {
+       snowLift = terrainMesh.userData.getSnowLiftAt(x, z) || 0;
+       instance.position.y += snowLift;
+       instance.updateMatrixWorld(true);
+     }
 
       // overlap check
       const b = computeVisibleBox(instance) ?? new THREE.Box3().setFromObject(instance);
@@ -295,62 +330,53 @@ export async function placeModelsOnTerrain(
       }
 
       // accept
-      scene.add(instance);
-
-      if (addColliders) {
-        if (colliderMode === "none") {
-          // skip
-        } else if (colliderMode === "perMesh") {
-          // old behavior (more precise, can be expensive if many)
-          registerCollidersFromObject(instance, {
-            minSize: colliderMinSize,
-            expand: colliderExpand,
-          });
-        } else {
-          // default: one collider per instance (fast)
-          registerColliderFromObjectBounds(instance, {
-            minSize: colliderMinSize,
-            expand: colliderExpand,
-          });
+      // expose source path and ensure sledges are named so controllers can find them
+      try {
+        instance.userData = instance.userData || {};
+        instance.userData.sourcePath = path;
+        if (/sledge|sled/i.test(path)) {
+          instance.userData.isSledge = true;
+          // also set a helpful name so controllers/hit-tests can match
+          instance.name = instance.name || "sledge";
         }
+      } catch (e) {}
+      scene.add(instance);
+      if (addColliders) {
+        // reuse 'b' computed above
+        const cbox = b.clone();
+
+        const groundY = hit.point.y + yOff + snowLift;
+        cbox.min.y = Math.max(cbox.min.y, groundY + 0.02);
+
+        registerColliderBox(cbox, { expand: colliderExpand ?? 0.03, minSize: colliderMinSize });
       }
 
       allPlaced.push({ x, z, minR: reqR, box: b, path });
       return true;
     };
 
-    // Fixed positions first
+    // Fixed positions first 
     if (Array.isArray(positions) && positions.length > 0) {
       let placedCount = 0;
-
       for (let i = 0; i < Math.min(count, positions.length); i++) {
         const p = positions[i];
+
         const x = p.x ?? p[0];
         const z = p.z ?? p[1];
         if (x == null || z == null) continue;
 
         const ok = tryPlaceAt(x, z, {
-          yawDeg:
-            typeof p.yawDeg === "number"
-              ? p.yawDeg
-              : typeof p.yaw === "number"
-                ? p.yaw
-                : null,
+          yawDeg: typeof p.yawDeg === "number" ? p.yawDeg : (typeof p.yaw === "number" ? p.yaw : null),
           scale: typeof p.scale === "number" ? p.scale : null,
           scaleMul: typeof p.scaleMul === "number" ? p.scaleMul : null,
-          targetHeightOverride:
-            typeof p.targetHeight === "number" ? p.targetHeight : null,
+          targetHeightOverride: typeof p.targetHeight === "number" ? p.targetHeight : null,
           yOffsetOverride: typeof p.yOffset === "number" ? p.yOffset : null,
-          minSpacingOverride:
-            typeof p.minSpacing === "number" ? p.minSpacing : null,
+          minSpacingOverride: typeof p.minSpacing === "number" ? p.minSpacing : null,
         });
 
         if (ok) placedCount++;
       }
-
-      console.log(
-        `Placed ${placedCount}/${count} instances of ${path} (fixed positions)`
-      );
+      console.log(`Placed ${placedCount}/${count} instances of ${path} (fixed positions)`);
       continue; // skip random placement
     }
 

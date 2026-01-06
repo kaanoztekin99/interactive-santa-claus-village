@@ -27,7 +27,7 @@ export function createCore() {
   pmremGenerator.compileEquirectangularShader();
 
   const controls = new PointerLockControls(camera, renderer.domElement);
-  scene.add(controls.getObject());
+  scene.add(controls.object);
   camera.position.set(0, 0, 0);
 
   const clock = new THREE.Clock();
