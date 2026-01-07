@@ -282,21 +282,62 @@ preloadAll(hdriEntries, pmrem).then(() => {
 // Clock HUD (top-right small overlay)
 // ------------------------------------------------------------
 const _createClockHud = () => {
-  const el = document.createElement("div");
-  el.id = "game-clock";
-  el.style.position = "fixed";
-  el.style.top = "10px";
-  el.style.right = "14px";
-  el.style.padding = "6px 10px";
-  el.style.background = "rgba(0,0,0,0.5)";
-  el.style.color = "#fff";
-  el.style.fontFamily = "monospace";
-  el.style.fontSize = "14px";
-  el.style.borderRadius = "6px";
-  el.style.zIndex = "9999";
-  el.style.pointerEvents = "none";
-  document.body.appendChild(el);
-  return el;
+  const container = document.createElement("div");
+  container.style.position = "fixed";
+  container.style.top = "10px";
+  container.style.right = "14px";
+  container.style.display = "flex";
+  container.style.gap = "8px";
+  container.style.zIndex = "9999";
+  
+  const clockEl = document.createElement("div");
+  clockEl.id = "game-clock";
+  clockEl.style.padding = "6px 10px";
+  clockEl.style.background = "rgba(0,0,0,0.5)";
+  clockEl.style.color = "#fff";
+  clockEl.style.fontFamily = "monospace";
+  clockEl.style.fontSize = "14px";
+  clockEl.style.borderRadius = "6px";
+  clockEl.style.pointerEvents = "none";
+  
+  const fullscreenBtn = document.createElement("button");
+  fullscreenBtn.id = "fullscreen-btn";
+  fullscreenBtn.innerText = "⛶";
+  fullscreenBtn.style.padding = "6px 10px";
+  fullscreenBtn.style.background = "rgba(0,0,0,0.5)";
+  fullscreenBtn.style.color = "#fff";
+  fullscreenBtn.style.fontFamily = "monospace";
+  fullscreenBtn.style.fontSize = "16px";
+  fullscreenBtn.style.borderRadius = "6px";
+  fullscreenBtn.style.border = "1px solid rgba(255,255,255,0.3)";
+  fullscreenBtn.style.cursor = "pointer";
+  fullscreenBtn.style.pointerEvents = "auto";
+  fullscreenBtn.style.transition = "all 200ms";
+  
+  fullscreenBtn.addEventListener("mouseover", () => {
+    fullscreenBtn.style.background = "rgba(0,0,0,0.8)";
+    fullscreenBtn.style.borderColor = "rgba(255,255,255,0.6)";
+  });
+  
+  fullscreenBtn.addEventListener("mouseout", () => {
+    fullscreenBtn.style.background = "rgba(0,0,0,0.5)";
+    fullscreenBtn.style.borderColor = "rgba(255,255,255,0.3)";
+  });
+  
+  fullscreenBtn.addEventListener("click", () => {
+    const elem = document.documentElement;
+    if (!document.fullscreenElement) {
+      elem.requestFullscreen().catch(err => console.log("Fullscreen error:", err));
+    } else {
+      document.exitFullscreen();
+    }
+  });
+  
+  container.appendChild(clockEl);
+  container.appendChild(fullscreenBtn);
+  document.body.appendChild(container);
+  
+  return clockEl;
 };
 
 const clockHud = _createClockHud();
@@ -316,9 +357,9 @@ function _desiredHdriForHour(hour) {
   return 3; // dark
 }
 
-// In-game time starts from your real local clock (nice for debugging).
-let gameTimeSeconds = new Date().getHours() * 3600 + new Date().getMinutes() * 60;
-
+// In-game time: Always start at 10:00 (not real local clock)
+let gameTimeSeconds = 8 * 3600;
+ 
 // timeScale: how fast a day passes.
 // 900 means: 1 real second = 900 game seconds = 15 in-game minutes.
 let timeScale = 900;
@@ -824,7 +865,7 @@ let terrainXZLocal = null;
         heightOffset: 3.0,
         groundSampler: getGroundY,
         minAboveGround: EYE_HEIGHT + 0.2,
-        maxBaseOffset: 3.0,
+        maxBaseOffset: 10.0,
       });
     } catch (e) {
       console.warn("createSledgeController failed:", e);
