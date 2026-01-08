@@ -18,8 +18,8 @@ University: Mid Sweden University
       </a>
     </td>
     <td align="center">
-      <a href="https://github.com/RICCARDO_GITHUB">
-        <img src="https://avatars.githubusercontent.com/RICCARDO_GITHUB" width="80" alt=""/><br />
+      <a href="https://github.com/riccardoaldrovandi">
+        <img src="https://avatars.githubusercontent.com/riccardoaldrovandi" width="80" alt=""/><br />
         <sub><b>Riccardo Aldrovandi</b></sub>
       </a>
     </td>
